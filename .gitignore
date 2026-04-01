@@ -16,6 +16,8 @@ dist
 .idea
 *.swp
 .vscode
+.venv
+results/
 
 # Other
 .DS_Store

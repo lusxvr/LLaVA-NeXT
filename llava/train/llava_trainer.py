@@ -1,7 +1,14 @@
+import math
 import os
+import sys
+import time
+import shutil
 import torch
 import torch.nn as nn
+import torch.cuda.amp as amp
+import torch.distributed as dist
 import datetime
+import numpy as np
 
 from accelerate import Accelerator
 from accelerate.utils import InitProcessGroupKwargs, GradientAccumulationPlugin
@@ -10,9 +17,21 @@ from torch.utils.data import Dataset, Sampler, DataLoader
 from trl.trainer import DPOTrainer
 from trl.trainer.utils import DPODataCollatorWithPadding
 
-from transformers import Trainer
-from transformers.trainer import is_sagemaker_mp_enabled, get_parameter_names, has_length, ALL_LAYERNORM_LAYERS, logger, is_accelerate_available, is_datasets_available, GradientAccumulationPlugin
+from transformers import Trainer, TrainerState, TrainerControl
+from transformers import is_torch_xla_available
+from packaging import version
+from transformers.trainer import (
+    is_sagemaker_mp_enabled, get_parameter_names, has_length, ALL_LAYERNORM_LAYERS,
+    logger, is_accelerate_available, is_datasets_available, GradientAccumulationPlugin,
+    deepspeed_init, HPSearchBackend, TrainOutput, speed_metrics, TRAINER_STATE_NAME,
+    find_batch_size, IterableDatasetShard, get_model_param_count,
+    DebugUnderflowOverflow, LengthGroupedSampler, ParallelMode,
+    SeedableRandomSampler, DistributedType, RandomSampler, dist,
+    deepspeed_load_checkpoint, _is_peft_model, get_dataloader_sampler,
+    accelerate_version, hp_params,
+)
 from transformers.trainer_utils import seed_worker
+from transformers.training_args import DebugOption
 from transformers.trainer_pt_utils import get_length_grouped_indices as get_length_grouped_indices_hf
 from transformers.trainer_pt_utils import AcceleratorConfig
 from typing import List, Optional
@@ -266,7 +285,6 @@ class LLaVATrainer(Trainer):
 
         self.trainable_params = [(p[0], p[1]) for p in self.model.named_parameters() if p[1].requires_grad]
 
-        print(f"Trainable parameters amount: {len(self.trainable_params)}")
 
         if not self.trainable_params:
             raise ValueError("No trainable parameters found.")
@@ -454,7 +472,7 @@ class LLaVATrainer(Trainer):
 
         # create accelerator object
         self.accelerator = Accelerator(
-            dispatch_batches=self.args.dispatch_batches, split_batches=self.args.split_batches, deepspeed_plugin=self.args.deepspeed_plugin, gradient_accumulation_plugin=gradient_accumulation_plugin, kwargs_handlers=[accelerator_kwargs]
+            split_batches=self.args.split_batches, deepspeed_plugin=self.args.deepspeed_plugin, gradient_accumulation_plugin=gradient_accumulation_plugin, kwargs_handlers=[accelerator_kwargs]
         )
         # some Trainer classes need to use `gather` instead of `gather_for_metrics`, thus we store a flag
         self.gather_function = self.accelerator.gather_for_metrics
@@ -703,6 +721,7 @@ class LLaVATrainer(Trainer):
         # Data loader and number of training steps
         train_dataloader = self.get_train_dataloader()
         if self.is_fsdp_xla_v2_enabled:
+            from torch_xla.distributed.parallel_loader import tpu_spmd_dataloader
             train_dataloader = tpu_spmd_dataloader(train_dataloader)
 
         # Setting up training control variables:
@@ -1136,6 +1155,7 @@ class LLaVATrainer(Trainer):
                     # each step. Since we are breaking the loop early, we need to manually
                     # insert the mark_step here.
                     if is_torch_xla_available():
+                        import torch_xla.core.xla_model as xm
                         xm.mark_step()
                     break
 
@@ -1153,6 +1173,8 @@ class LLaVATrainer(Trainer):
             if DebugOption.TPU_METRICS_DEBUG in self.args.debug:
                 if is_torch_xla_available():
                     # tpu-comment: Logging debug metrics for PyTorch/XLA (compile, execute times, ops, etc.)
+                    import torch_xla.core.xla_model as xm
+                    import torch_xla.debug.metrics as met
                     xm.master_print(met.metrics_report())
                 else:
                     logger.warning(
@@ -1170,10 +1192,12 @@ class LLaVATrainer(Trainer):
         if args.load_best_model_at_end and self.state.best_model_checkpoint is not None:
             # Wait for everyone to get here so we are sure the model has been saved by process 0.
             if is_torch_xla_available():
+                import torch_xla.core.xla_model as xm
                 xm.rendezvous("load_best_model_at_end")
             elif args.parallel_mode == ParallelMode.DISTRIBUTED:
                 dist.barrier()
             elif is_sagemaker_mp_enabled():
+                import smdistributed.modelparallel.torch as smp
                 smp.barrier()
 
             self._load_best_model()
@@ -1219,12 +1243,6 @@ class LLaVATrainer(Trainer):
         # for the embedding layer by removing the forward post hook.
         if self.neftune_noise_alpha is not None:
             self._deactivate_neftune(self.model)
-
-        plot_graphs_based_on_log_history(
-            log_history=self.state.log_history,
-            output_dir=run_dir,
-            metrics=["train_loss"],
-        )
 
         return TrainOutput(self.state.global_step, train_loss, metrics)
 

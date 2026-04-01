@@ -82,6 +82,18 @@ class LlavaMetaModel:
                 vision_tower = self.vision_tower
             vision_tower.load_model()
 
+            # If the requested resampler type differs from the one in the checkpoint, rebuild it
+            requested_resampler_type = getattr(model_args, "mm_resampler_type", None)
+            current_resampler_type = getattr(self.config, "mm_resampler_type", None)
+            if requested_resampler_type != current_resampler_type:
+                vision_resampler = build_vision_resampler(model_args, vision_tower=vision_tower)
+                for k, v in vision_resampler.config.items():
+                    setattr(self.config, k, v)
+                if fsdp is not None and len(fsdp) > 0:
+                    self.vision_resampler[0] = vision_resampler
+                else:
+                    self.vision_resampler = vision_resampler
+
             # In case it is frozen by LoRA
             for p in self.vision_resampler.parameters():
                 p.requires_grad = True
@@ -122,6 +134,18 @@ class LlavaMetaModel:
             rank0_print(f"Loaded mm projector weights from {pretrain_mm_mlp_adapter}. Incompatible keys: {incompatible_keys}")
             incompatible_keys = self.vision_resampler.load_state_dict(get_w(mm_projector_weights, "vision_resampler"), strict=False)
             rank0_print(f"Loaded vision resampler weights from {pretrain_mm_mlp_adapter}. Incompatible keys: {incompatible_keys}")
+
+        mm_streaming_pretrained = getattr(model_args, "mm_streaming_pretrained", None)
+        if mm_streaming_pretrained and getattr(self.config, "mm_resampler_type", None) == "streaming_agg":
+            ckpt = torch.load(mm_streaming_pretrained, map_location="cpu")
+            state_dict = ckpt.get("state_dict", ckpt) if isinstance(ckpt, dict) else ckpt
+            for prefix in ("aggregator.", "model.aggregator.", "vision_resampler.", ""):
+                stripped = {k[len(prefix):]: v for k, v in state_dict.items() if k.startswith(prefix)}
+                if stripped and prefix != "":
+                    state_dict = stripped
+                    break
+            incompatible_keys = self.vision_resampler.load_state_dict(state_dict, strict=False)
+            rank0_print(f"Loaded streaming aggregator weights from {mm_streaming_pretrained}. Incompatible keys: {incompatible_keys}")
 
 
 def unpad_image(tensor, original_size):
@@ -194,7 +218,23 @@ class LlavaMetaForCausalLM(ABC):
         # image_features = self.get_model().vision_resampler(image_features, images=images)
         image_features = self.get_model().mm_projector(image_features)
         return image_features
-    
+
+    def encode_video_streaming(self, video_frames):
+        """
+        Encode a single video through the StreamingStateAggregator.
+
+        Args:
+            video_frames: (T, C, H, W) — all frames of one video
+
+        Returns:
+            (S, D_llm) — S state tokens projected to LLM dimension
+        """
+        frame_feats = self.get_model().get_vision_tower()(video_frames)  # (T, P, D_v)
+        state_tokens = self.get_model().vision_resampler(
+            frame_feats.unsqueeze(0), return_state_tokens=True
+        ).squeeze(0)                                                # (S, D_v)
+        return self.get_model().mm_projector(state_tokens)          # (S, D_llm)
+
     def encode_multimodals(self, videos_or_images, video_idx_in_batch, split_sizes=None):
         videos_or_images_features = self.get_model().get_vision_tower()(videos_or_images)
         per_videos_or_images_features = torch.split(videos_or_images_features, split_sizes, dim=0)  # tuple, (dim_1, 576, 4096)
@@ -274,20 +314,36 @@ class LlavaMetaForCausalLM(ABC):
                 else:
                     images_list.append(image.unsqueeze(0))
 
-            concat_images = torch.cat([image for image in images_list], dim=0)
-            split_sizes = [image.shape[0] for image in images_list]
-            encoded_image_features = self.encode_images(concat_images)
-            # image_features,all_faster_video_features = self.encode_multimodals(concat_images, video_idx_in_batch, split_sizes)
+            use_streaming = getattr(self.config, "mm_resampler_type", None) == "streaming_agg"
 
-            # This is a list, each element is [num_images, patch * patch, dim]
-            # rank_print(f"Concat images : {concat_images.shape}")
-            encoded_image_features = torch.split(encoded_image_features, split_sizes)
-            image_features = []
-            for idx, image_feat in enumerate(encoded_image_features):
-                if idx in video_idx_in_batch:
-                    image_features.append(self.get_2dPool(image_feat))
-                else:
-                    image_features.append(image_feat)
+            if use_streaming and video_idx_in_batch:
+                # Streaming path: encode videos with StreamingStateAggregator,
+                # images with the standard projector.  Process per-item to keep
+                # the streaming aggregator's batch size at 1 (avoids padding
+                # across videos of different lengths).
+                image_features = []
+                for idx, image in enumerate(images_list):
+                    if idx in video_idx_in_batch:
+                        # image: (T, C, H, W) — all frames of this video
+                        image_features.append(self.encode_video_streaming(image))  # (S, D_llm)
+                    else:
+                        feat = self.encode_images(image)   # (1_or_crops, P, D_llm)
+                        image_features.append(feat)
+            else:
+                concat_images = torch.cat([image for image in images_list], dim=0)
+                split_sizes = [image.shape[0] for image in images_list]
+                encoded_image_features = self.encode_images(concat_images)
+                # image_features,all_faster_video_features = self.encode_multimodals(concat_images, video_idx_in_batch, split_sizes)
+
+                # This is a list, each element is [num_images, patch * patch, dim]
+                # rank_print(f"Concat images : {concat_images.shape}")
+                encoded_image_features = torch.split(encoded_image_features, split_sizes)
+                image_features = []
+                for idx, image_feat in enumerate(encoded_image_features):
+                    if idx in video_idx_in_batch:
+                        image_features.append(self.get_2dPool(image_feat))
+                    else:
+                        image_features.append(image_feat)
             # image_features = self.encode_multimodals(concat_images, video_idx_in_batch, split_sizes)
             # rank_print(f"Encoded image feats : {[x.shape for x in image_features]}")
             # image_features = torch.split(image_features, split_sizes, dim=0)
@@ -296,7 +352,11 @@ class LlavaMetaForCausalLM(ABC):
             mm_newline_position = getattr(self.config, "mm_newline_position", "one_token")
 
             if mm_patch_merge_type == "flat":
-                image_features = [x.flatten(0, 1) for x in image_features]
+                # Streaming video features are already 2D (S, D_llm); skip flatten for those.
+                image_features = [
+                    x if (use_streaming and idx in video_idx_in_batch) else x.flatten(0, 1)
+                    for idx, x in enumerate(image_features)
+                ]
 
             elif mm_patch_merge_type.startswith("spatial"):
                 new_image_features = []
@@ -307,7 +367,11 @@ class LlavaMetaForCausalLM(ABC):
                     # we want to first unflatten it to (2, 2, h, w, hidden_size)
                     # rank0_print("At least we are reaching here")
                     # import pdb; pdb.set_trace()
-                    if image_idx in video_idx_in_batch:  # video operations
+                    if image_idx in video_idx_in_batch and use_streaming:
+                        # Streaming aggregator output: already flat (S, D_llm).
+                        # No spatial pooling, no newline tokens needed.
+                        new_image_features.append(image_feature)
+                    elif image_idx in video_idx_in_batch:  # video operations
                         # rank0_print("Video")
                         if mm_newline_position == "grid":
                             # Grid-wise

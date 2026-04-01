@@ -112,6 +112,14 @@ class ModelArguments:
     delay_load: Optional[bool] = field(default=True)
     add_faster_video: Optional[bool] = field(default=False)
     faster_token_stride: Optional[int] = field(default=10)
+    mm_streaming_input_dim: Optional[int] = field(default=1152)
+    mm_streaming_state_dim: Optional[int] = field(default=1152)
+    mm_streaming_num_state_tokens: Optional[int] = field(default=512)
+    mm_streaming_num_layers: Optional[int] = field(default=4)
+    mm_streaming_num_heads: Optional[int] = field(default=8)
+    mm_streaming_mlp_ratio: Optional[float] = field(default=4.0)
+    mm_streaming_chunk_size: Optional[int] = field(default=729)
+    mm_streaming_pretrained: Optional[str] = field(default=None, metadata={"help": "Path to a pretrained StreamingStateAggregator checkpoint."})
 
 
 
@@ -1667,8 +1675,8 @@ def train(attn_implementation=None):
 
         total_params = sum(p.ds_numel if hasattr(p, "ds_numel") else p.numel() for p in model.parameters())
         trainable_params = sum(p.ds_numel if hasattr(p, "ds_numel") else p.numel() for p in model.parameters() if p.requires_grad)
-        rank0_print(f"Total parameters: ~{total_params/1e6:.2f} MB)")
-        rank0_print(f"Trainable parameters: ~{trainable_params/1e6:.2f} MB)")
+        rank0_print(f"Total parameters: ~{total_params/1e6:.2f} M)")
+        rank0_print(f"Trainable parameters: ~{trainable_params/1e6:.2f} M)")
         if training_args.bits in [4, 8]:
             model.get_model().mm_projector.to(dtype=compute_dtype, device=training_args.device)
 

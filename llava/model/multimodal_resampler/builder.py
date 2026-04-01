@@ -30,5 +30,16 @@ def build_vision_resampler(model_args, delay_load=False, **kwargs):
         return Qformer(model_args, **kwargs)
     elif resampler_type is None:
         return IdentityMap()
+    elif resampler_type == "streaming_agg":
+        from .streaming_aggregator import StreamingStateAggregator
+        return StreamingStateAggregator(
+            input_dim=getattr(model_args, "mm_streaming_input_dim", 1152),
+            state_dim=getattr(model_args, "mm_streaming_state_dim", 1152),
+            num_state_tokens=getattr(model_args, "mm_streaming_num_state_tokens", 512),
+            num_layers=getattr(model_args, "mm_streaming_num_layers", 4),
+            num_heads=getattr(model_args, "mm_streaming_num_heads", 8),
+            mlp_ratio=getattr(model_args, "mm_streaming_mlp_ratio", 4.0),
+            chunk_size=getattr(model_args, "mm_streaming_chunk_size", 729),
+        )
 
     raise ValueError(f"Unknown resampler type: {resampler_type}")
