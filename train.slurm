@@ -1,9 +1,9 @@
 #!/bin/bash
 #SBATCH --job-name=train
 #SBATCH --nodes=1
-#SBATCH --partition=hard 
-#SBATCH -C A6000
-#SBATCH --gpus-per-node=2
+#SBATCH --partition=heavy 
+##SBATCH -C A6000
+#SBATCH --gpus-per-node=1
 #SBATCH --time=47:59:00
 #SBATCH --array=0
 #SBATCH --output=/home/wiedmann/LLaVA-NeXT/logs/train/%A-%a.out

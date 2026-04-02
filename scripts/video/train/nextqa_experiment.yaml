@@ -3,3 +3,15 @@ datasets:
       sampling_strategy: "all"
     - json_path: /data/wiedmann/hub/datasets--lmms-lab--LLaVA-Video-178K/snapshots/6d8c562dc26d70042a0d9704d1cae58c94b89098/0_30_s_nextqa/0_30_s_nextqa_oe_qa_processed.json
       sampling_strategy: "all"
+    - json_path: /data/wiedmann/hub/datasets--lmms-lab--LLaVA-Video-178K/snapshots/6d8c562dc26d70042a0d9704d1cae58c94b89098/30_60_s_nextqa/30_60_s_nextqa_mc_qa_processed.json
+      sampling_strategy: "all"
+    - json_path: /data/wiedmann/hub/datasets--lmms-lab--LLaVA-Video-178K/snapshots/6d8c562dc26d70042a0d9704d1cae58c94b89098/30_60_s_nextqa/30_60_s_nextqa_oe_qa_processed.json
+      sampling_strategy: "all"
+    - json_path: /data/wiedmann/hub/datasets--lmms-lab--LLaVA-Video-178K/snapshots/6d8c562dc26d70042a0d9704d1cae58c94b89098/1_2_m_nextqa/1_2_m_nextqa_mc_qa_processed.json
+      sampling_strategy: "all"
+    - json_path: /data/wiedmann/hub/datasets--lmms-lab--LLaVA-Video-178K/snapshots/6d8c562dc26d70042a0d9704d1cae58c94b89098/1_2_m_nextqa/1_2_m_nextqa_oe_qa_processed.json
+      sampling_strategy: "all"
+    - json_path: /data/wiedmann/hub/datasets--lmms-lab--LLaVA-Video-178K/snapshots/6d8c562dc26d70042a0d9704d1cae58c94b89098/2_3_m_nextqa/2_3_m_nextqa_mc_qa_processed.json
+      sampling_strategy: "all"
+    - json_path: /data/wiedmann/hub/datasets--lmms-lab--LLaVA-Video-178K/snapshots/6d8c562dc26d70042a0d9704d1cae58c94b89098/2_3_m_nextqa/2_3_m_nextqa_oe_qa_processed.json
+      sampling_strategy: "all"
