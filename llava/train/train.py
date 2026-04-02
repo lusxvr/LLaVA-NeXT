@@ -119,6 +119,7 @@ class ModelArguments:
     mm_streaming_num_heads: Optional[int] = field(default=8)
     mm_streaming_mlp_ratio: Optional[float] = field(default=4.0)
     mm_streaming_chunk_size: Optional[int] = field(default=729)
+    mm_streaming_vision_chunk_size: Optional[int] = field(default=8, metadata={"help": "Number of frames passed through the vision tower per incremental aggregator step."})
     mm_streaming_pretrained: Optional[str] = field(default=None, metadata={"help": "Path to a pretrained StreamingStateAggregator checkpoint."})
 
 
@@ -1426,6 +1427,15 @@ def get_model(model_args, training_args, bnb_model_from_pretrained_args):
 
                 deepspeed.utils.set_z3_leaf_modules(model, [Qwen2MoeSparseMoeBlock])
             else:
+                # Always load config as LlavaQwenConfig so that model_type and vocab_size
+                # are serialized correctly when the trainer saves checkpoints.
+                # AutoConfig.from_pretrained (used in the generic overwrite_config path above)
+                # may produce a config of the wrong class ("llava" instead of "llava_qwen"),
+                # which drops vocab_size and saves the wrong model_type.
+                llava_qwen_cfg = LlavaQwenConfig.from_pretrained(model_args.model_name_or_path, cache_dir=training_args.cache_dir)
+                for k, v in overwrite_config.items():
+                    setattr(llava_qwen_cfg, k, v)
+                customized_kwargs["config"] = llava_qwen_cfg
                 model = LlavaQwenForCausalLM.from_pretrained(
                     model_args.model_name_or_path,
                     cache_dir=training_args.cache_dir,

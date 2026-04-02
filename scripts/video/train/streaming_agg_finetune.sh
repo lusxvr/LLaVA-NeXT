@@ -15,7 +15,7 @@
 #   8192 context window fits 512 video tokens + multi-turn text comfortably.
 
 IMAGE_FOLDER=""
-VIDEO_FOLDER="/data/wiedmann/hub/datasets--lmms-lab--LLaVA-Video-178K/snapshots/6d8c562dc26d70042a0d9704d1cae58c94b89098/0_30_s_nextqa"
+VIDEO_FOLDER="/data/wiedmann"
 DATA_YAML="scripts/video/train/nextqa_experiment.yaml"
 
 # Optional: path to a StreamingStateAggregator checkpoint from rep_sim linear
@@ -47,7 +47,7 @@ export WANDB_PROJECT="llava-streaming-agg"
 PREV_STAGE_CHECKPOINT="/data/wiedmann/hub/models--lmms-lab--llava-onevision-qwen2-7b-ov/snapshots/0b07bf7565e244cf4f39982249eafe8cd799d6dd"
 
 PROMPT_VERSION="qwen_1_5"
-RUN_NAME="llavanext-${VISION_MODEL_VERSION_CLEAN}-${LLM_VERSION_CLEAN}-streaming_agg_s512"
+RUN_NAME="llavanext-${VISION_MODEL_VERSION_CLEAN}-${LLM_VERSION_CLEAN}-nextqa-streaming_agg_s512"
 echo "RUN_NAME: ${RUN_NAME}"
 echo "PREV_STAGE_CHECKPOINT: ${PREV_STAGE_CHECKPOINT}"
 
@@ -73,6 +73,7 @@ deepspeed --master_port 30000 \
     --mm_streaming_num_layers 4 \
     --mm_streaming_num_heads 8 \
     --mm_streaming_chunk_size 729 \
+    --mm_streaming_vision_chunk_size 32 \
     --mm_streaming_pretrained "${STREAMING_PRETRAINED}" \
     \
     --mm_patch_merge_type spatial_unpad \
@@ -82,15 +83,15 @@ deepspeed --master_port 30000 \
     \
     --bf16 True \
     --run_name $RUN_NAME \
-    --output_dir ./work_dirs/$RUN_NAME \
+    --output_dir /data/wiedmann/llava-streaming/$RUN_NAME \
     --num_train_epochs 1 \
     --per_device_train_batch_size 2 \
     --per_device_eval_batch_size 4 \
     --gradient_accumulation_steps 16 \
     --evaluation_strategy "no" \
     --save_strategy "steps" \
-    --save_steps 50 \
-    --save_total_limit 2 \
+    --save_steps 100 \
+    --save_total_limit 1 \
     --learning_rate 1e-4 \
     --weight_decay 0. \
     --warmup_ratio 0.03 \
@@ -99,11 +100,11 @@ deepspeed --master_port 30000 \
     --tf32 True \
     --model_max_length 8192 \
     --gradient_checkpointing True \
-    --dataloader_num_workers 4 \
+    --dataloader_num_workers 2 \
     --lazy_preprocess True \
     --report_to wandb \
     --dataloader_drop_last True \
-    --frames_upbound 32 \
+    --frames_upbound 128 \
     --add_time_instruction False \
-    --force_sample True
+    --force_sample False
 exit 0;

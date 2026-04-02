@@ -223,17 +223,37 @@ class LlavaMetaForCausalLM(ABC):
         """
         Encode a single video through the StreamingStateAggregator.
 
+        The vision tower is called on vision_chunk_size frames at a time so
+        peak activation memory is O(vision_chunk_size × P × D_v) instead of
+        O(T × P × D_v).  The aggregator state is updated incrementally after
+        each vision-tower chunk.
+
         Args:
             video_frames: (T, C, H, W) — all frames of one video
 
         Returns:
             (S, D_llm) — S state tokens projected to LLM dimension
         """
-        frame_feats = self.get_model().get_vision_tower()(video_frames)  # (T, P, D_v)
-        state_tokens = self.get_model().vision_resampler(
-            frame_feats.unsqueeze(0), return_state_tokens=True
-        ).squeeze(0)                                                # (S, D_v)
-        return self.get_model().mm_projector(state_tokens)          # (S, D_llm)
+        resampler = self.get_model().vision_resampler
+        vision_tower = self.get_model().get_vision_tower()
+        vision_chunk_size = getattr(self.config, 'mm_streaming_vision_chunk_size', 8)
+
+        T = video_frames.shape[0]
+        state = resampler.init_state(batch_size=1, device=video_frames.device)
+
+        # When the vision tower is frozen, each chunk needs no gradient storage,
+        # so torch.no_grad() eliminates autograd overhead while the loop still
+        # bounds peak forward-pass activation memory to O(chunk × layers × P × D).
+        vision_frozen = not next(vision_tower.parameters()).requires_grad
+        encode_chunk = torch.no_grad()(vision_tower) if vision_frozen else vision_tower
+
+        for t0 in range(0, T, vision_chunk_size):
+            chunk_frames = video_frames[t0:t0 + vision_chunk_size]    # (K, C, H, W)
+            chunk_feats = encode_chunk(chunk_frames)                   # (K, P, D_v)
+            state = resampler.step(state, chunk_feats.unsqueeze(0))   # (1, K, P, D_v)
+
+        state_tokens = resampler.finalize(state, return_state_tokens=True).squeeze(0)  # (S, D_v)
+        return self.get_model().mm_projector(state_tokens)                              # (S, D_llm)
 
     def encode_multimodals(self, videos_or_images, video_idx_in_batch, split_sizes=None):
         videos_or_images_features = self.get_model().get_vision_tower()(videos_or_images)

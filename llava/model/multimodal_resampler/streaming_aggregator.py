@@ -269,6 +269,7 @@ class StreamingStateAggregator(nn.Module):
         ])
         self.state_norm = nn.LayerNorm(state_dim)
         self.frame_norm = nn.LayerNorm(state_dim)
+        self._frame_pos_cache: dict = {}
 
     @property
     def hidden_size(self) -> int:
@@ -284,6 +285,7 @@ class StreamingStateAggregator(nn.Module):
             "mm_streaming_num_layers": self.num_layers,
             "mm_streaming_num_heads": self.state_decoder[0].self_attn.num_heads,
             "mm_streaming_chunk_size": self.chunk_size,
+            "mm_streaming_vision_chunk_size": 8,
         }
 
     def _init_state(self, batch_size, device):
@@ -295,15 +297,18 @@ class StreamingStateAggregator(nn.Module):
         return state.unsqueeze(0).repeat(batch_size, 1, 1)
 
     def _build_frame_pos_2d(self, batch_size, chunk_len, device):
-        grid_size = math.isqrt(chunk_len)
-        if grid_size * grid_size == chunk_len:
-            rows = torch.arange(grid_size, device=device, dtype=torch.float32)
-            cols = torch.arange(grid_size, device=device, dtype=torch.float32)
-            grid = torch.stack(torch.meshgrid(rows, cols, indexing="ij"), dim=-1).reshape(-1, 2)
-        else:
-            t = torch.arange(chunk_len, device=device, dtype=torch.float32)
-            grid = torch.stack((t, torch.zeros_like(t)), dim=-1)
-        return grid.unsqueeze(0).expand(batch_size, -1, -1)
+        key = (chunk_len, device)
+        if key not in self._frame_pos_cache:
+            grid_size = math.isqrt(chunk_len)
+            if grid_size * grid_size == chunk_len:
+                rows = torch.arange(grid_size, device=device, dtype=torch.float32)
+                cols = torch.arange(grid_size, device=device, dtype=torch.float32)
+                grid = torch.stack(torch.meshgrid(rows, cols, indexing="ij"), dim=-1).reshape(-1, 2)
+            else:
+                t = torch.arange(chunk_len, device=device, dtype=torch.float32)
+                grid = torch.stack((t, torch.zeros_like(t)), dim=-1)
+            self._frame_pos_cache[key] = grid
+        return self._frame_pos_cache[key].unsqueeze(0).expand(batch_size, -1, -1)
 
     def _dual_decode(self, state, frame_tokens, state_pos, frame_pos, frame_mask, frame_attn_mask):
         for i, (state_block, frame_block) in enumerate(zip(self.state_decoder, self.frame_decoder)):
@@ -318,46 +323,49 @@ class StreamingStateAggregator(nn.Module):
                 frame_tokens = frame_tokens * frame_mask.unsqueeze(-1).to(frame_tokens.dtype)
         return state, frame_tokens
 
-    def forward(
+    def init_state(self, batch_size: int, device) -> torch.Tensor:
+        """Return (B, S, state_dim) initial recurrent state."""
+        return self._init_state(batch_size, device)
+
+    def step(
         self,
+        state: torch.Tensor,
         frame_embeddings: torch.Tensor,
         mask: Optional[torch.Tensor] = None,
-        return_state_tokens: bool = False,
     ) -> torch.Tensor:
         """
+        Process one chunk of frame embeddings and return the updated state.
+
+        Intended for incremental use: call init_state() once, then step() for
+        each chunk of vision-encoder output, then finalize().  This lets the
+        vision encoder be chunked independently so peak activation memory is
+        O(vision_chunk × P × D) rather than O(T × P × D).
+
         Args:
-            frame_embeddings: (B, T, N, D) patch-wise OR (B, T, D) / (T, D) frame-wise
-            mask:             optional (B, T) bool mask, True = valid frame
-            return_state_tokens: if True, return (B, S, state_dim) instead of (B, state_dim)
+            state:            (B, S, state_dim) — current recurrent state
+            frame_embeddings: (B, T, N, D) patch-wise OR (B, T*N, D) already flat
+            mask:             optional bool mask; (B, T) for 4-D input,
+                              (B, T*N) for already-flat 3-D input
 
         Returns:
-            (B, S, state_dim) if return_state_tokens else (B, state_dim)
-            Squeezed to drop the batch dim when input was unbatched.
+            (B, S, state_dim) updated state
         """
         frame_embeddings, mask = _flatten_patch_dim(frame_embeddings, mask)
-
-        unbatched = frame_embeddings.ndim == 2
-        if unbatched:
-            frame_embeddings = frame_embeddings.unsqueeze(0)
-            if mask is not None:
-                mask = mask.unsqueeze(0)
-
-        B, T, _ = frame_embeddings.shape
-        device = frame_embeddings.device
+        B = state.shape[0]
+        T_flat = frame_embeddings.shape[1]
+        device = state.device
+        state_pos = self.state_pos.unsqueeze(0).expand(B, -1)
 
         if mask is not None:
             mask = mask.bool()
 
-        state = self._init_state(B, device)
-        state_pos = self.state_pos.unsqueeze(0).expand(B, -1)
-
         K = self.chunk_size
-        for t0 in range(0, T, K):
-            t1 = min(t0 + K, T)
+        for t0 in range(0, T_flat, K):
+            t1 = min(t0 + K, T_flat)
             chunk_len = t1 - t0
 
             frame_chunk = frame_embeddings[:, t0:t1]
-            frame_tokens = self.frame_proj(frame_chunk)  # requires_grad=True from frame_proj weights
+            frame_tokens = self.frame_proj(frame_chunk)
             frame_pos = self._build_frame_pos_2d(B, chunk_len, device)
 
             if mask is not None:
@@ -384,12 +392,59 @@ class StreamingStateAggregator(nn.Module):
 
             state = torch.where(active_1d.view(B, 1, 1), new_state, state)
 
-        if return_state_tokens:
-            if unbatched:
-                return state.squeeze(0)   # (S, state_dim)
-            return state                  # (B, S, state_dim)
+        return state
 
-        video_embedding = self.state_norm(state).mean(dim=1)
+    def finalize(
+        self,
+        state: torch.Tensor,
+        return_state_tokens: bool = False,
+    ) -> torch.Tensor:
+        """
+        Produce the final output from a completed recurrent state.
+
+        Args:
+            state:               (B, S, state_dim)
+            return_state_tokens: if True return (B, S, state_dim), else (B, state_dim)
+
+        Returns:
+            (B, S, state_dim) or (B, state_dim)
+        """
+        if return_state_tokens:
+            return state
+        return self.state_norm(state).mean(dim=1)
+
+    def forward(
+        self,
+        frame_embeddings: torch.Tensor,
+        mask: Optional[torch.Tensor] = None,
+        return_state_tokens: bool = False,
+    ) -> torch.Tensor:
+        """
+        Args:
+            frame_embeddings: (B, T, N, D) patch-wise OR (B, T, D) / (T, D) frame-wise
+            mask:             optional (B, T) bool mask, True = valid frame
+            return_state_tokens: if True, return (B, S, state_dim) instead of (B, state_dim)
+
+        Returns:
+            (B, S, state_dim) if return_state_tokens else (B, state_dim)
+            Squeezed to drop the batch dim when input was unbatched.
+        """
+        frame_embeddings, mask = _flatten_patch_dim(frame_embeddings, mask)
+
+        unbatched = frame_embeddings.ndim == 2
         if unbatched:
-            video_embedding = video_embedding.squeeze(0)
-        return video_embedding
+            frame_embeddings = frame_embeddings.unsqueeze(0)
+            if mask is not None:
+                mask = mask.unsqueeze(0)
+
+        if mask is not None:
+            mask = mask.bool()
+
+        B = frame_embeddings.shape[0]
+        state = self.init_state(B, frame_embeddings.device)
+        state = self.step(state, frame_embeddings, mask)
+        out = self.finalize(state, return_state_tokens)
+
+        if unbatched:
+            out = out.squeeze(0)
+        return out
