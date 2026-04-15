@@ -105,6 +105,13 @@ class LlavaMetaModel:
         self.config.mm_vision_select_feature = mm_vision_select_feature
         self.config.mm_patch_merge_type = mm_patch_merge_type
 
+        # Store runtime streaming parameter so encode_video_streaming picks it up
+        # after the model is built (it is not part of the aggregator's architecture config).
+        if getattr(model_args, "mm_resampler_type", None) == "streaming_agg":
+            self.config.mm_streaming_vision_chunk_size = getattr(
+                model_args, "mm_streaming_vision_chunk_size", 4
+            )
+
         
         if not hasattr(self.config, 'add_faster_video'):
             if model_args.add_faster_video:
@@ -146,6 +153,12 @@ class LlavaMetaModel:
                     break
             incompatible_keys = self.vision_resampler.load_state_dict(state_dict, strict=False)
             rank0_print(f"Loaded streaming aggregator weights from {mm_streaming_pretrained}. Incompatible keys: {incompatible_keys}")
+            if incompatible_keys.missing_keys:
+                rank0_print(
+                    f"WARNING: {len(incompatible_keys.missing_keys)} keys missing after loading "
+                    f"mm_streaming_pretrained — checkpoint structure may not match the aggregator. "
+                    f"Missing: {incompatible_keys.missing_keys[:5]}{'...' if len(incompatible_keys.missing_keys) > 5 else ''}"
+                )
 
 
 def unpad_image(tensor, original_size):
@@ -236,7 +249,7 @@ class LlavaMetaForCausalLM(ABC):
         """
         resampler = self.get_model().vision_resampler
         vision_tower = self.get_model().get_vision_tower()
-        vision_chunk_size = getattr(self.config, 'mm_streaming_vision_chunk_size', 8)
+        vision_chunk_size = getattr(self.config, 'mm_streaming_vision_chunk_size', 4)
 
         T = video_frames.shape[0]
         state = resampler.init_state(batch_size=1, device=video_frames.device)
@@ -250,7 +263,7 @@ class LlavaMetaForCausalLM(ABC):
         for t0 in range(0, T, vision_chunk_size):
             chunk_frames = video_frames[t0:t0 + vision_chunk_size]    # (K, C, H, W)
             chunk_feats = encode_chunk(chunk_frames)                   # (K, P, D_v)
-            state = resampler.step(state, chunk_feats.unsqueeze(0))   # (1, K, P, D_v)
+            state = resampler.step(state, chunk_feats.unsqueeze(0), frame_offset=t0)   # state: (1, S, state_dim)
 
         state_tokens = resampler.finalize(state, return_state_tokens=True).squeeze(0)  # (S, D_v)
         return self.get_model().mm_projector(state_tokens)                              # (S, D_llm)

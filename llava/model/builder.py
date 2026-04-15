@@ -50,12 +50,22 @@ def load_pretrained_model(model_path, model_base, model_name, load_8bit=False, l
         is_multimodal = False
 
     if "llava" in model_name.lower() or is_multimodal:
+        # Auto-detect LoRA checkpoint by presence of adapter_config.json
+        adapter_config_path = os.path.join(model_path, "adapter_config.json")
+        if os.path.exists(adapter_config_path):
+            import json
+            with open(adapter_config_path) as f:
+                adapter_cfg = json.load(f)
+            if model_base is None:
+                model_base = adapter_cfg.get("base_model_name_or_path")
+                rank0_print(f"Auto-detected LoRA checkpoint. Using base model: {model_base}")
+
         # Load LLaVA model
         if "lora" in model_name.lower() and model_base is None:
             warnings.warn(
                 "There is `lora` in model name but no `model_base` is provided. If you are loading a LoRA model, please provide the `model_base` argument. Detailed instruction: https://github.com/haotian-liu/LLaVA#launch-a-model-worker-lora-weights-unmerged."
             )
-        if "lora" in model_name.lower() and model_base is not None:
+        if ("lora" in model_name.lower() or os.path.exists(adapter_config_path)) and model_base is not None:
             lora_cfg_pretrained = AutoConfig.from_pretrained(model_path)
             tokenizer = AutoTokenizer.from_pretrained(model_base, use_fast=False)
             rank0_print("Loading LLaVA from base model...")
@@ -77,6 +87,18 @@ def load_pretrained_model(model_path, model_base, model_name, load_8bit=False, l
                 lora_cfg_pretrained = LlavaGemmaConfig.from_pretrained(model_path)
                 tokenizer = AutoTokenizer.from_pretrained(model_base, use_fast=False)
                 model = LlavaGemmaForCausalLM.from_pretrained(model_base, low_cpu_mem_usage=True, config=lora_cfg_pretrained, attn_implementation=attn_implementation, **kwargs)
+            elif "qwen" in model_name.lower() or "quyen" in model_name.lower():
+                from llava.model.language_model.llava_qwen import LlavaQwenConfig
+
+                lora_cfg_pretrained = LlavaQwenConfig.from_pretrained(model_path)
+                if overwrite_config is not None:
+                    for k, v in overwrite_config.items():
+                        setattr(lora_cfg_pretrained, k, v)
+                tokenizer = AutoTokenizer.from_pretrained(model_base, use_fast=False)
+                if "moe" in model_name.lower() or "A14B" in model_name.lower():
+                    model = LlavaQwenMoeForCausalLM.from_pretrained(model_base, low_cpu_mem_usage=True, config=lora_cfg_pretrained, attn_implementation=attn_implementation, **kwargs)
+                else:
+                    model = LlavaQwenForCausalLM.from_pretrained(model_base, low_cpu_mem_usage=True, config=lora_cfg_pretrained, attn_implementation=attn_implementation, **kwargs)
             else:
                 from llava.model.language_model.llava_llama import LlavaConfig
 
@@ -149,6 +171,14 @@ def load_pretrained_model(model_path, model_base, model_name, load_8bit=False, l
                 tokenizer = AutoTokenizer.from_pretrained(model_base, use_fast=False)
                 llava_cfg = LlavaConfig.from_pretrained(model_path)
                 model = LlavaLlamaForCausalLM.from_pretrained(model_base, low_cpu_mem_usage=True, config=llava_cfg, **kwargs)
+            elif "qwen" in model_name.lower() or "quyen" in model_name.lower():
+                from llava.model.language_model.llava_qwen import LlavaQwenConfig
+                tokenizer = AutoTokenizer.from_pretrained(model_base)
+                cfg_pretrained = LlavaQwenConfig.from_pretrained(model_path)
+                if overwrite_config is not None:
+                    for k, v in overwrite_config.items():
+                        setattr(cfg_pretrained, k, v)
+                model = LlavaQwenForCausalLM.from_pretrained(model_base, low_cpu_mem_usage=True, config=cfg_pretrained, attn_implementation=attn_implementation, **kwargs)
             else:
                 raise ValueError(f"Model {model_name} not supported")
 

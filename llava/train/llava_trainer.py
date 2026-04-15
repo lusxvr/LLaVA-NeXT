@@ -664,8 +664,12 @@ class LLaVATrainer(Trainer):
         return self.optimizer
 
     def _save_checkpoint(self, model, trial, metrics=None):
-        if getattr(self.args, "tune_mm_mlp_adapter", False) or (
-            hasattr(self.args, "mm_tunable_parts") and (len(self.args.mm_tunable_parts.split(",")) == 1 and ("mm_mlp_adapter" in self.args.mm_tunable_parts or "mm_vision_resampler" in self.args.mm_tunable_parts))
+        if not getattr(self.args, "lora_enable", False) and (
+            getattr(self.args, "tune_mm_mlp_adapter", False) or (
+                hasattr(self.args, "mm_tunable_parts") and (
+                    set(self.args.mm_tunable_parts.split(",")) <= {"mm_mlp_adapter", "mm_vision_resampler"}
+                )
+            )
         ):
             from transformers.trainer_utils import PREFIX_CHECKPOINT_DIR
 
@@ -686,6 +690,25 @@ class LLaVATrainer(Trainer):
                 torch.save(weight_to_save, os.path.join(output_dir, f"mm_projector.bin"))
         else:
             super(LLaVATrainer, self)._save_checkpoint(model, trial, metrics)
+
+            # When LoRA is enabled, the base HF checkpoint saves the adapter but
+            # omits non_lora_trainables (mm_projector, vision_resampler) and the
+            # model config.  Save them here so the checkpoint is self-contained.
+            if getattr(self.args, "lora_enable", False):
+                from transformers.trainer_utils import PREFIX_CHECKPOINT_DIR
+
+                checkpoint_folder = f"{PREFIX_CHECKPOINT_DIR}-{self.state.global_step}"
+                run_dir = self._get_output_dir(trial=trial)
+                output_dir = os.path.join(run_dir, checkpoint_folder)
+
+                non_lora_state_dict = {
+                    k: maybe_zero_3(v, ignore_status=True, name=k).cpu()
+                    for k, v in self.model.named_parameters()
+                    if "lora_" not in k and v.requires_grad
+                }
+                if self.args.local_rank in [-1, 0]:
+                    self.model.config.save_pretrained(output_dir)
+                    torch.save(non_lora_state_dict, os.path.join(output_dir, "non_lora_trainables.bin"))
 
     def _save(self, output_dir: Optional[str] = None, state_dict=None):
         if getattr(self.args, "tune_mm_mlp_adapter", False):
@@ -1265,8 +1288,12 @@ class LLaVADPOTrainer(DPOTrainer):
             return super()._get_train_sampler()
 
     def _save_checkpoint(self, model, trial, metrics=None):
-        if getattr(self.args, "tune_mm_mlp_adapter", False) or (
-            hasattr(self.args, "mm_tunable_parts") and (len(self.args.mm_tunable_parts.split(",")) == 1 and ("mm_mlp_adapter" in self.args.mm_tunable_parts or "mm_vision_resampler" in self.args.mm_tunable_parts))
+        if not getattr(self.args, "lora_enable", False) and (
+            getattr(self.args, "tune_mm_mlp_adapter", False) or (
+                hasattr(self.args, "mm_tunable_parts") and (
+                    set(self.args.mm_tunable_parts.split(",")) <= {"mm_mlp_adapter", "mm_vision_resampler"}
+                )
+            )
         ):
             from transformers.trainer_utils import PREFIX_CHECKPOINT_DIR
 

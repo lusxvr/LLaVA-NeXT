@@ -114,12 +114,13 @@ class ModelArguments:
     faster_token_stride: Optional[int] = field(default=10)
     mm_streaming_input_dim: Optional[int] = field(default=1152)
     mm_streaming_state_dim: Optional[int] = field(default=1152)
-    mm_streaming_num_state_tokens: Optional[int] = field(default=512)
+    mm_streaming_num_state_tokens: Optional[int] = field(default=4096)
     mm_streaming_num_layers: Optional[int] = field(default=4)
     mm_streaming_num_heads: Optional[int] = field(default=8)
     mm_streaming_mlp_ratio: Optional[float] = field(default=4.0)
-    mm_streaming_chunk_size: Optional[int] = field(default=729)
-    mm_streaming_vision_chunk_size: Optional[int] = field(default=8, metadata={"help": "Number of frames passed through the vision tower per incremental aggregator step."})
+    mm_streaming_frames_per_chunk: Optional[int] = field(default=4, metadata={"help": "Number of frames processed per aggregator recurrent step."})
+    mm_streaming_patches_per_frame: Optional[int] = field(default=729, metadata={"help": "Number of patch tokens per frame from the vision encoder (e.g. 27x27=729 for SigLIP-so400m-384)."})
+    mm_streaming_vision_chunk_size: Optional[int] = field(default=4, metadata={"help": "Number of frames passed through the vision tower per incremental aggregator step."})
     mm_streaming_pretrained: Optional[str] = field(default=None, metadata={"help": "Path to a pretrained StreamingStateAggregator checkpoint."})
 
 
@@ -141,6 +142,7 @@ class DataArguments:
     frames_upbound: Optional[int] = field(default=0)
     add_time_instruction: Optional[bool] = field(default=False)
     force_sample: Optional[bool] = field(default=False)
+    val_split_fraction: float = field(default=0.05, metadata={"help": "Fraction of training data to hold out as validation set (0 disables the split)."})
 
 
 @dataclass
@@ -271,8 +273,10 @@ def safe_save_model_for_hf_trainer(trainer: transformers.Trainer, output_dir: st
     """Collects the state dict and dump to disk."""
     if hasattr(trainer.args, "tune_mm_mlp_adapter") and trainer.args.tune_mm_mlp_adapter:
         check_only_save_mm_adapter_tunnable = True
-    # only has mm_mlp_adapter and mm_vision_resampler in the tuneable parts
-    elif hasattr(trainer.args, "mm_tunable_parts") and (len(trainer.args.mm_tunable_parts.split(",")) == 1 and ("mm_mlp_adapter" in trainer.args.mm_tunable_parts or "mm_vision_resampler" in trainer.args.mm_tunable_parts)):
+    # only has mm_mlp_adapter and/or mm_vision_resampler in the tuneable parts
+    elif hasattr(trainer.args, "mm_tunable_parts") and (
+        set(trainer.args.mm_tunable_parts.split(",")) <= {"mm_mlp_adapter", "mm_vision_resampler"}
+    ):
         check_only_save_mm_adapter_tunnable = True
     else:
         check_only_save_mm_adapter_tunnable = False
@@ -1042,6 +1046,11 @@ class LazySupervisedDataset(Dataset):
                 self.list_data_dict.extend(cur_data_dict)
 
         rank0_print(f"Loaded {len(self.list_data_dict)} samples from {data_path}")
+        # Globally shuffle with a fixed seed so the order is consistent across
+        # runs (for comparability) but not biased by duration-bin concatenation order.
+        rng = random.Random(42)
+        rng.shuffle(self.list_data_dict)
+        rank0_print("Globally shuffled dataset with seed 42")
         rank0_print("Formatting inputs...Skip in lazy mode")
         self.tokenizer = tokenizer
         self.data_args = data_args
@@ -1300,9 +1309,24 @@ class DataCollatorForSupervisedDataset(object):
 
 def make_supervised_data_module(tokenizer: transformers.PreTrainedTokenizer, data_args) -> Dict:
     """Make dataset and collator for supervised fine-tuning."""
-    train_dataset = LazySupervisedDataset(tokenizer=tokenizer, data_path=data_args.data_path, data_args=data_args)
+    full_dataset = LazySupervisedDataset(tokenizer=tokenizer, data_path=data_args.data_path, data_args=data_args)
+
+    val_fraction = data_args.val_split_fraction
+    n_total = len(full_dataset)
+    n_val = max(1, int(n_total * val_fraction))
+    n_train = n_total - n_val
+
+    # Deterministic split so checkpoints are comparable across runs
+    rng = torch.Generator().manual_seed(42)
+    train_indices, val_indices = torch.utils.data.random_split(
+        range(n_total), [n_train, n_val], generator=rng
+    )
+    train_dataset = torch.utils.data.Subset(full_dataset, train_indices.indices)
+    eval_dataset = torch.utils.data.Subset(full_dataset, val_indices.indices)
+    rank0_print(f"Split dataset: {n_train} train / {n_val} val ({val_fraction:.0%} held out)")
+
     data_collator = DataCollatorForSupervisedDataset(tokenizer=tokenizer)
-    return dict(train_dataset=train_dataset, eval_dataset=None, data_collator=data_collator)
+    return dict(train_dataset=train_dataset, eval_dataset=eval_dataset, data_collator=data_collator)
 
 
 def get_model(model_args, training_args, bnb_model_from_pretrained_args):
@@ -1681,6 +1705,16 @@ def train(attn_implementation=None):
             if "mm_language_model" in tunable_parts:
                 for name, param in model.named_parameters():
                     if "vision_tower" not in name and "mm_projector" not in name and "vision_resampler" not in name:
+                        param.requires_grad_(True)
+
+            # When LoRA is enabled, mm_tunable_parts processing froze the LoRA
+            # adapters via model.requires_grad_(False) above.  Re-enable them now
+            # so LoRA trains regardless of whether mm_language_model is in
+            # tunable_parts.  find_all_linear_names already excludes vision_tower,
+            # mm_projector and vision_resampler, so LoRA params are LLM-only.
+            if training_args.lora_enable:
+                for name, param in model.named_parameters():
+                    if "lora_" in name:
                         param.requires_grad_(True)
 
         total_params = sum(p.ds_numel if hasattr(p, "ds_numel") else p.numel() for p in model.parameters())

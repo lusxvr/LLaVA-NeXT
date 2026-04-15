@@ -1,12 +1,27 @@
 """
-StreamingStateAggregator — LLaVA-NeXT integration adapter.
+StreamingStateAggregator — simple streaming state baseline.
 
-Adapted from rep_sim/streaming_aggregator_draft.py (webdataset branch).
-Key changes vs. the original:
-  - _flatten_patch_dim inlined (no dep on aggregators module)
-  - `return_state_tokens` flag added to forward()
-  - `hidden_size` and `config` properties for LLaVA builder / trainer
-  - `num_layers` stored as instance attribute
+Architecture: learned state tokens are updated recurrently via a stack of
+StateDecoderBlocks.  Each block:
+  1. State self-attention (RoPE-1D over state positions)
+  2. Cross-attention to the current frame chunk (RoPE-2D on frame keys)
+  3. FFN
+
+The frame path of the old dual-decoder is removed; only the state stream is
+maintained.
+
+Chunked streaming:
+  - call init_state() once, then step() for each vision-encoder chunk,
+    then finalize().  Peak activation memory per decode step is
+    O(frames_per_chunk × patches_per_frame × state_dim).
+
+LLaVA norm notes:
+  - Frame tokens are selected from layer -2 of SigLIP (before the final
+    LayerNorm of the vision encoder).  frame_proj maps them to state_dim;
+    norm_ctx inside each block normalises them so their scale is compatible
+    with the state stream.
+  - State tokens are pre-normed inside each block (pre-norm architecture).
+  - state_norm at the end brings output into the space the LLM expects.
 """
 
 import math
@@ -18,30 +33,19 @@ from typing import Optional
 
 
 # ---------------------------------------------------------------------------
-# Helpers (inlined from rep_sim/aggregators.py)
+# Helpers
 # ---------------------------------------------------------------------------
 
 def _flatten_patch_dim(
     frame_embeddings: torch.Tensor,
     mask: Optional[torch.Tensor] = None,
 ):
-    """
-    If frame_embeddings has shape (B, T, N, D) or (T, N, D), flatten the
-    T×N token dimension into T*N so the rest of the module sees a flat
-    sequence.  The mask (B, T) is expanded to (B, T*N) accordingly.
-
-    Shapes that are already 2D or 3D (no patch dim) pass through unchanged.
-    """
+    """(B, T, N, D) → (B, T*N, D); expand (B, T) mask to (B, T*N)."""
     if frame_embeddings.ndim == 4:
         B, T, N, D = frame_embeddings.shape
         frame_embeddings = frame_embeddings.reshape(B, T * N, D)
         if mask is not None:
             mask = mask.unsqueeze(-1).expand(B, T, N).reshape(B, T * N)
-    elif frame_embeddings.ndim == 3:
-        # Could be (B, T, D) — no patch dim — or unbatched (T, N, D)
-        # Disambiguate: if called after unsqueeze(0) for unbatched input we
-        # already have (1, T, D); just pass through.
-        pass
     return frame_embeddings, mask
 
 
@@ -134,43 +138,39 @@ class RoPE2D(nn.Module):
 # ---------------------------------------------------------------------------
 
 class Attention(nn.Module):
-    def __init__(self, dim, num_heads=8, qkv_bias=True, rope=None):
+    def __init__(self, dim, num_heads=8, rope=None):
         super().__init__()
         self.num_heads = num_heads
         self.head_dim = dim // num_heads
         self.scale = self.head_dim ** -0.5
-        self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
-        self.proj = nn.Linear(dim, dim)
+        self.qkv = nn.Linear(dim, dim * 3, bias=True)
+        self.proj = nn.Linear(dim, dim, bias=True)
         self.rope = rope
 
-    def forward(self, x, pos=None, key_padding_mask=None):
+    def forward(self, x, pos=None):
         B, N, C = x.shape
         qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
         q, k, v = qkv.unbind(0)
         if self.rope is not None and pos is not None:
             q = self.rope(q, pos)
             k = self.rope(k, pos)
-        attn_mask = None
-        if key_padding_mask is not None:
-            attn_mask = torch.zeros((B, 1, N, N), device=x.device, dtype=q.dtype)
-            attn_mask = attn_mask.masked_fill(~key_padding_mask.bool()[:, None, None, :], torch.finfo(q.dtype).min)
-        out = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, scale=self.scale)
+        out = F.scaled_dot_product_attention(q, k, v, scale=self.scale)
         return self.proj(out.transpose(1, 2).reshape(B, N, C))
 
 
 class CrossAttention(nn.Module):
-    def __init__(self, dim, num_heads=8, qkv_bias=True, rope_k=None):
+    def __init__(self, dim, num_heads=8, rope_k=None):
         super().__init__()
         self.num_heads = num_heads
         self.head_dim = dim // num_heads
         self.scale = self.head_dim ** -0.5
-        self.proj_q = nn.Linear(dim, dim, bias=qkv_bias)
-        self.proj_k = nn.Linear(dim, dim, bias=qkv_bias)
-        self.proj_v = nn.Linear(dim, dim, bias=qkv_bias)
-        self.proj_out = nn.Linear(dim, dim)
+        self.proj_q = nn.Linear(dim, dim, bias=True)
+        self.proj_k = nn.Linear(dim, dim, bias=True)
+        self.proj_v = nn.Linear(dim, dim, bias=True)
+        self.proj_out = nn.Linear(dim, dim, bias=True)
         self.rope_k = rope_k
 
-    def forward(self, x, context, x_pos=None, ctx_pos=None, ctx_key_padding_mask=None):
+    def forward(self, x, context, ctx_pos=None, ctx_key_padding_mask=None):
         B, N, C = x.shape
         M = context.shape[1]
         q = self.proj_q(x).reshape(B, N, self.num_heads, self.head_dim).transpose(1, 2)
@@ -181,7 +181,10 @@ class CrossAttention(nn.Module):
         attn_mask = None
         if ctx_key_padding_mask is not None:
             attn_mask = torch.zeros((B, 1, N, M), device=x.device, dtype=q.dtype)
-            attn_mask = attn_mask.masked_fill(~ctx_key_padding_mask.bool()[:, None, None, :], torch.finfo(q.dtype).min)
+            attn_mask = attn_mask.masked_fill(
+                ~ctx_key_padding_mask.bool()[:, None, None, :],
+                torch.finfo(q.dtype).min,
+            )
         out = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, scale=self.scale)
         return self.proj_out(out.transpose(1, 2).reshape(B, N, C))
 
@@ -198,22 +201,36 @@ class FeedForward(nn.Module):
         return self.fc2(self.act(self.fc1(x)))
 
 
-class DecoderBlock(nn.Module):
-    def __init__(self, dim, num_heads=8, mlp_ratio=4.0, qkv_bias=True, rope_sattn=None, rope_cattn=None):
+class StateDecoderBlock(nn.Module):
+    """
+    Pre-norm decoder block:
+      state = state + self_attn(norm1(state))            [RoPE-1D on state]
+      state = state + cross_attn(norm2(state), norm_ctx(frames))  [RoPE-2D on frame keys]
+      state = state + ffn(norm3(state))
+    """
+
+    def __init__(self, dim, num_heads=8, mlp_ratio=4.0, rope_sattn=None, rope_cattn=None):
         super().__init__()
         self.norm1 = nn.LayerNorm(dim)
-        self.self_attn = Attention(dim, num_heads=num_heads, qkv_bias=qkv_bias, rope=rope_sattn)
+        self.self_attn = Attention(dim, num_heads=num_heads, rope=rope_sattn)
+
         self.norm2 = nn.LayerNorm(dim)
-        self.norm_context = nn.LayerNorm(dim)
-        self.cross_attn = CrossAttention(dim, num_heads=num_heads, qkv_bias=qkv_bias, rope_k=rope_cattn)
+        self.norm_ctx = nn.LayerNorm(dim)   # re-normalize SigLIP tokens after frame_proj
+        self.cross_attn = CrossAttention(dim, num_heads=num_heads, rope_k=rope_cattn)
+
         self.norm3 = nn.LayerNorm(dim)
         self.ffn = FeedForward(dim, mlp_ratio=mlp_ratio)
 
-    def forward(self, x, context, x_pos=None, ctx_pos=None, self_key_padding_mask=None, ctx_key_padding_mask=None):
-        x = x + self.self_attn(self.norm1(x), x_pos, key_padding_mask=self_key_padding_mask)
-        x = x + self.cross_attn(self.norm2(x), self.norm_context(context), x_pos, ctx_pos, ctx_key_padding_mask=ctx_key_padding_mask)
-        x = x + self.ffn(self.norm3(x))
-        return x
+    def forward(self, state, frame_tokens, state_pos=None, frame_pos=None, frame_attn_mask=None):
+        state = state + self.self_attn(self.norm1(state), state_pos)
+        state = state + self.cross_attn(
+            self.norm2(state),
+            self.norm_ctx(frame_tokens),
+            ctx_pos=frame_pos,
+            ctx_key_padding_mask=frame_attn_mask,
+        )
+        state = state + self.ffn(self.norm3(state))
+        return state
 
 
 # ---------------------------------------------------------------------------
@@ -223,53 +240,63 @@ class DecoderBlock(nn.Module):
 class StreamingStateAggregator(nn.Module):
     """
     Compresses (B, T, N, D) patch-wise video embeddings into
-    (B, S, state_dim) state tokens via a recurrent dual-decoder.
+    (B, S, state_dim) state tokens via a recurrent state decoder.
 
-    chunk_size controls how many tokens are processed per recurrent step.
-    For SigLIP-so400m-384 with 27×27=729 patches/frame, set chunk_size=729
-    to process one frame per step.
+    Streaming / chunked use:
+        state = agg.init_state(B, device)
+        for chunk in vision_encoder_chunks:
+            state = agg.step(state, chunk)
+        out = agg.finalize(state, return_state_tokens=True)
+
+    frames_per_chunk controls how many frames the decoder processes in one
+    recurrent sub-step.  For SigLIP-so400m-384 (27×27 = 729 patches/frame),
+    set frames_per_chunk=1 and patches_per_frame=729 to process one frame
+    per decoder step.
     """
 
-    def __init__(
-        self,
-        input_dim: int = 1152,
-        state_dim: int = 1152,
-        num_state_tokens: int = 512,
-        num_layers: int = 4,
-        num_heads: int = 8,
-        mlp_ratio: float = 4.0,
-        rope_freq: float = 100.0,
-        chunk_size: int = 729,
-    ):
+    def __init__(self, model_args):
         super().__init__()
-        self.input_dim = input_dim
-        self.state_dim = state_dim
-        self.num_state_tokens = num_state_tokens
-        self.num_layers = num_layers
-        self.chunk_size = chunk_size
+        self.input_dim        = model_args.mm_streaming_input_dim
+        self.state_dim        = model_args.mm_streaming_state_dim
+        self.num_state_tokens = model_args.mm_streaming_num_state_tokens
+        self.num_layers       = model_args.mm_streaming_num_layers
+        self.frames_per_chunk = model_args.mm_streaming_frames_per_chunk
+        self.patches_per_frame = model_args.mm_streaming_patches_per_frame
+        self.chunk_size        = self.frames_per_chunk * self.patches_per_frame
+
+        num_heads = model_args.mm_streaming_num_heads
+        mlp_ratio = model_args.mm_streaming_mlp_ratio
+        rope_freq = 100.0
 
         rope1d = RoPE1D(freq=rope_freq)
         rope2d = RoPE2D(freq=rope_freq)
 
-        self.state_tokens = nn.Embedding(num_state_tokens, input_dim)
-        self.state_proj = nn.Linear(input_dim, state_dim)
-        self.register_buffer("state_pos", torch.arange(num_state_tokens, dtype=torch.float32))
+        # Learned initial state — embed directly into state_dim
+        self.state_tokens = nn.Embedding(self.num_state_tokens, self.state_dim)
+        self.register_buffer("state_pos", torch.arange(self.num_state_tokens, dtype=torch.long))
 
-        self.frame_proj = nn.Linear(input_dim, state_dim)
+        # Project vision-encoder tokens into state_dim
+        self.frame_proj = nn.Linear(self.input_dim, self.state_dim)
 
-        self.state_decoder = nn.ModuleList([
-            DecoderBlock(state_dim, num_heads=num_heads, mlp_ratio=mlp_ratio,
-                         rope_sattn=rope1d, rope_cattn=rope2d)
-            for _ in range(num_layers)
+        self.decoder = nn.ModuleList([
+            StateDecoderBlock(
+                self.state_dim,
+                num_heads=num_heads,
+                mlp_ratio=mlp_ratio,
+                rope_sattn=rope1d,   # 1D positions over state tokens
+                rope_cattn=rope2d,   # 2D spatial positions over frame tokens
+            )
+            for _ in range(self.num_layers)
         ])
-        self.frame_decoder = nn.ModuleList([
-            DecoderBlock(state_dim, num_heads=num_heads, mlp_ratio=mlp_ratio,
-                         rope_sattn=rope2d, rope_cattn=rope1d)
-            for _ in range(num_layers)
-        ])
-        self.state_norm = nn.LayerNorm(state_dim)
-        self.frame_norm = nn.LayerNorm(state_dim)
+
+        # Final norm before handing off to the LLM
+        self.state_norm = nn.LayerNorm(self.state_dim)
+
         self._frame_pos_cache: dict = {}
+
+    # ------------------------------------------------------------------
+    # LLaVA builder / trainer interface
+    # ------------------------------------------------------------------
 
     @property
     def hidden_size(self) -> int:
@@ -283,69 +310,79 @@ class StreamingStateAggregator(nn.Module):
             "mm_streaming_state_dim": self.state_dim,
             "mm_streaming_num_state_tokens": self.num_state_tokens,
             "mm_streaming_num_layers": self.num_layers,
-            "mm_streaming_num_heads": self.state_decoder[0].self_attn.num_heads,
-            "mm_streaming_chunk_size": self.chunk_size,
-            "mm_streaming_vision_chunk_size": 8,
+            "mm_streaming_num_heads": self.decoder[0].self_attn.num_heads,
+            "mm_streaming_mlp_ratio": self.decoder[0].ffn.fc1.out_features / self.state_dim,
+            "mm_streaming_frames_per_chunk": self.frames_per_chunk,
+            "mm_streaming_patches_per_frame": self.patches_per_frame,
         }
 
-    def _init_state(self, batch_size, device):
-        idx = torch.arange(self.num_state_tokens, device=device)
-        state = self.state_proj(self.state_tokens(idx))  # (S, state_dim)
-        # .repeat() produces a contiguous, properly-tracked tensor; .expand() creates
-        # a non-contiguous view that some PyTorch/DeepSpeed versions fail to detect
-        # as requiring grad inside torch.utils.checkpoint (use_reentrant=False).
-        return state.unsqueeze(0).repeat(batch_size, 1, 1)
-
-    def _build_frame_pos_2d(self, batch_size, chunk_len, device):
-        key = (chunk_len, device)
-        if key not in self._frame_pos_cache:
-            grid_size = math.isqrt(chunk_len)
-            if grid_size * grid_size == chunk_len:
-                rows = torch.arange(grid_size, device=device, dtype=torch.float32)
-                cols = torch.arange(grid_size, device=device, dtype=torch.float32)
-                grid = torch.stack(torch.meshgrid(rows, cols, indexing="ij"), dim=-1).reshape(-1, 2)
-            else:
-                t = torch.arange(chunk_len, device=device, dtype=torch.float32)
-                grid = torch.stack((t, torch.zeros_like(t)), dim=-1)
-            self._frame_pos_cache[key] = grid
-        return self._frame_pos_cache[key].unsqueeze(0).expand(batch_size, -1, -1)
-
-    def _dual_decode(self, state, frame_tokens, state_pos, frame_pos, frame_mask, frame_attn_mask):
-        for i, (state_block, frame_block) in enumerate(zip(self.state_decoder, self.frame_decoder)):
-            prev_state, prev_frame = state, frame_tokens
-            state = state_block(prev_state, prev_frame, state_pos, frame_pos,
-                                self_key_padding_mask=None,
-                                ctx_key_padding_mask=frame_attn_mask)
-            if i < self.num_layers - 1:
-                frame_tokens = frame_block(prev_frame, prev_state, frame_pos, state_pos,
-                                           self_key_padding_mask=frame_attn_mask,
-                                           ctx_key_padding_mask=None)
-                frame_tokens = frame_tokens * frame_mask.unsqueeze(-1).to(frame_tokens.dtype)
-        return state, frame_tokens
+    # ------------------------------------------------------------------
+    # Recurrent interface
+    # ------------------------------------------------------------------
 
     def init_state(self, batch_size: int, device) -> torch.Tensor:
         """Return (B, S, state_dim) initial recurrent state."""
-        return self._init_state(batch_size, device)
+        idx = torch.arange(self.num_state_tokens, device=device)
+        state = self.state_tokens(idx)             # (S, state_dim)
+        return state.unsqueeze(0).repeat(batch_size, 1, 1)
+
+    def _build_frame_pos_2d(self, batch_size, chunk_len, frame_offset, device):
+        """Build (chunk_len, 2) position tensor for cross-attention keys.
+
+        Dim 0 — absolute frame index in the video (encodes temporal order).
+        Dim 1 — flat spatial patch index within the frame (0 … patches_per_frame-1).
+        """
+        key = (chunk_len, frame_offset, device)
+        if key not in self._frame_pos_cache:
+            ppf = self.patches_per_frame
+            assert chunk_len % ppf == 0, (
+                f"chunk_len ({chunk_len}) is not divisible by patches_per_frame ({ppf}). "
+                f"patches_per_frame must match the vision encoder's patch count per frame."
+            )
+            n_frames = chunk_len // ppf
+            t_positions = (
+                torch.arange(n_frames, device=device, dtype=torch.float32) + frame_offset
+            ).repeat_interleave(ppf)                                             # (chunk_len,)
+            s_positions = torch.arange(ppf, device=device, dtype=torch.float32).repeat(n_frames)  # (chunk_len,)
+            self._frame_pos_cache[key] = torch.stack([t_positions, s_positions], dim=-1)  # (chunk_len, 2)
+        return self._frame_pos_cache[key].unsqueeze(0).expand(batch_size, -1, -1)
+
+    def _decode(self, state, frame_embeddings_slice, state_pos, frame_pos, frame_attn_mask):
+        """Project, mask and decode one chunk of raw vision-encoder tokens.
+
+        frame_embeddings_slice: (B, chunk_len, input_dim) — no-grad slice from the
+            vision tower.  frame_proj is computed HERE so that, when this function
+            is wrapped by torch_checkpoint, the frame_proj activations are recomputed
+            during backward instead of being stored for the full recurrent chain.
+            Gradient for frame_proj.weight is still correctly accumulated: the
+            checkpoint's backward reruns this function and autograd finds frame_proj
+            in the computation graph via `self`.
+        """
+        frame_tokens = self.frame_proj(frame_embeddings_slice)
+        # Zero padded positions; cross-attention also masks them, but being explicit
+        # avoids any numerical noise from LayerNorm on near-zero inputs.
+        frame_tokens = frame_tokens * frame_attn_mask.unsqueeze(-1).to(frame_tokens.dtype)
+        for block in self.decoder:
+            state = block(state, frame_tokens, state_pos, frame_pos, frame_attn_mask)
+        return state
 
     def step(
         self,
         state: torch.Tensor,
         frame_embeddings: torch.Tensor,
         mask: Optional[torch.Tensor] = None,
+        frame_offset: int = 0,
     ) -> torch.Tensor:
         """
         Process one chunk of frame embeddings and return the updated state.
-
-        Intended for incremental use: call init_state() once, then step() for
-        each chunk of vision-encoder output, then finalize().  This lets the
-        vision encoder be chunked independently so peak activation memory is
-        O(vision_chunk × P × D) rather than O(T × P × D).
 
         Args:
             state:            (B, S, state_dim) — current recurrent state
             frame_embeddings: (B, T, N, D) patch-wise OR (B, T*N, D) already flat
             mask:             optional bool mask; (B, T) for 4-D input,
                               (B, T*N) for already-flat 3-D input
+            frame_offset:     absolute index of the first frame in this chunk
+                              within the full video (used for temporal positions)
 
         Returns:
             (B, S, state_dim) updated state
@@ -364,33 +401,32 @@ class StreamingStateAggregator(nn.Module):
             t1 = min(t0 + K, T_flat)
             chunk_len = t1 - t0
 
-            frame_chunk = frame_embeddings[:, t0:t1]
-            frame_tokens = self.frame_proj(frame_chunk)
-            frame_pos = self._build_frame_pos_2d(B, chunk_len, device)
+            abs_frame_offset = frame_offset + t0 // self.patches_per_frame
+            frame_pos = self._build_frame_pos_2d(B, chunk_len, abs_frame_offset, device)
 
             if mask is not None:
                 chunk_mask = mask[:, t0:t1].bool()
             else:
                 chunk_mask = torch.ones((B, chunk_len), device=device, dtype=torch.bool)
 
-            active_1d = chunk_mask.any(dim=1)
-            chunk_attn_mask = chunk_mask.clone()
-            if (~active_1d).any():
-                chunk_attn_mask[~active_1d, 0] = True
-
-            frame_tokens = frame_tokens * chunk_mask.unsqueeze(-1).to(frame_tokens.dtype)
+            # Ensure at least one valid key per sample to avoid NaN in attn
+            active = chunk_mask.any(dim=1)
+            attn_mask = chunk_mask.clone()
+            if (~active).any():
+                attn_mask[~active, 0] = True
 
             if self.training:
-                new_state, _ = torch_checkpoint(
-                    self._dual_decode, state, frame_tokens, state_pos,
-                    frame_pos, chunk_mask, chunk_attn_mask, use_reentrant=False,
+                new_state = torch_checkpoint(
+                    self._decode, state, frame_embeddings[:, t0:t1], state_pos,
+                    frame_pos, attn_mask, use_reentrant=False,
                 )
             else:
-                new_state, _ = self._dual_decode(
-                    state, frame_tokens, state_pos, frame_pos, chunk_mask, chunk_attn_mask,
+                new_state = self._decode(
+                    state, frame_embeddings[:, t0:t1], state_pos, frame_pos, attn_mask
                 )
 
-            state = torch.where(active_1d.view(B, 1, 1), new_state, state)
+            # Skip update for fully-padded samples
+            state = torch.where(active.view(B, 1, 1), new_state, state)
 
         return state
 
@@ -400,18 +436,20 @@ class StreamingStateAggregator(nn.Module):
         return_state_tokens: bool = False,
     ) -> torch.Tensor:
         """
-        Produce the final output from a completed recurrent state.
+        Apply final norm and optionally pool.
 
         Args:
             state:               (B, S, state_dim)
-            return_state_tokens: if True return (B, S, state_dim), else (B, state_dim)
-
-        Returns:
-            (B, S, state_dim) or (B, state_dim)
+            return_state_tokens: True → (B, S, state_dim); False → (B, state_dim)
         """
+        normed = self.state_norm(state)
         if return_state_tokens:
-            return state
-        return self.state_norm(state).mean(dim=1)
+            return normed
+        return normed.mean(dim=1)
+
+    # ------------------------------------------------------------------
+    # Convenience: full-sequence forward
+    # ------------------------------------------------------------------
 
     def forward(
         self,
@@ -421,13 +459,9 @@ class StreamingStateAggregator(nn.Module):
     ) -> torch.Tensor:
         """
         Args:
-            frame_embeddings: (B, T, N, D) patch-wise OR (B, T, D) / (T, D) frame-wise
+            frame_embeddings: (B, T, N, D) or (B, T, D) or unbatched (T, D)
             mask:             optional (B, T) bool mask, True = valid frame
-            return_state_tokens: if True, return (B, S, state_dim) instead of (B, state_dim)
-
-        Returns:
-            (B, S, state_dim) if return_state_tokens else (B, state_dim)
-            Squeezed to drop the batch dim when input was unbatched.
+            return_state_tokens: True → (B, S, state_dim); False → (B, state_dim)
         """
         frame_embeddings, mask = _flatten_patch_dim(frame_embeddings, mask)
 
