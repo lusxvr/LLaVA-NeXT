@@ -303,6 +303,10 @@ class StreamingStateAggregator(nn.Module):
         return self.state_dim
 
     @property
+    def output_dim(self) -> int:
+        return self.state_dim
+
+    @property
     def config(self) -> dict:
         return {
             "mm_resampler_type": "streaming_agg",
