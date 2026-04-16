@@ -11,8 +11,8 @@
 #   - LLM               (Qwen2-7B)
 #
 # Token budget:
-#   S=512 state tokens per video vs. ~5824 for the spatial-pool baseline.
-#   8192 context window fits 512 video tokens + multi-turn text comfortably.
+#   S=4096 state tokens per video vs. ~5824 for the spatial-pool baseline.
+#   8192 context window fits 4096 video tokens + short text context.
 
 IMAGE_FOLDER=""
 VIDEO_FOLDER="/data/wiedmann"
@@ -20,7 +20,7 @@ DATA_YAML="scripts/video/train/nextqa_experiment.yaml"
 
 # Optional: path to a StreamingStateAggregator checkpoint from rep_sim linear
 # probe training. Leave empty to start from random initialisation.
-STREAMING_PRETRAINED=""
+STREAMING_PRETRAINED="/data/wiedmann/llava-streaming/aggregator_pretrain_4096/aggregator_best.pt"
 
 ############### Prepare Envs #################
 if [ -z "$CUDA_HOME" ] || [ ! -f "$CUDA_HOME/bin/nvcc" ]; then
@@ -47,7 +47,7 @@ export WANDB_PROJECT="llava-streaming-agg"
 PREV_STAGE_CHECKPOINT="/data/wiedmann/hub/models--lmms-lab--llava-onevision-qwen2-7b-ov/snapshots/0b07bf7565e244cf4f39982249eafe8cd799d6dd"
 
 PROMPT_VERSION="qwen_1_5"
-RUN_NAME="llavanext-${VISION_MODEL_VERSION_CLEAN}-${LLM_VERSION_CLEAN}-nextqa-streaming_agg_s512"
+RUN_NAME="llavanext-${VISION_MODEL_VERSION_CLEAN}-${LLM_VERSION_CLEAN}-nextqa_shuffled-streaming_baseline_final_lora_agg_fc4_s4096"
 echo "RUN_NAME: ${RUN_NAME}"
 echo "PREV_STAGE_CHECKPOINT: ${PREV_STAGE_CHECKPOINT}"
 
@@ -69,11 +69,12 @@ deepspeed --master_port 30000 \
     --mm_resampler_type streaming_agg \
     --mm_streaming_input_dim 1152 \
     --mm_streaming_state_dim 1152 \
-    --mm_streaming_num_state_tokens 512 \
+    --mm_streaming_num_state_tokens 4096 \
     --mm_streaming_num_layers 4 \
     --mm_streaming_num_heads 8 \
-    --mm_streaming_chunk_size 729 \
-    --mm_streaming_vision_chunk_size 32 \
+    --mm_streaming_frames_per_chunk 4 \
+    --mm_streaming_patches_per_frame 729 \
+    --mm_streaming_vision_chunk_size 4 \
     --mm_streaming_pretrained "${STREAMING_PRETRAINED}" \
     \
     --mm_patch_merge_type spatial_unpad \
@@ -81,14 +82,20 @@ deepspeed --master_port 30000 \
     \
     --mm_tunable_parts="mm_mlp_adapter,mm_vision_resampler" \
     \
+    --lora_enable True \
+    --lora_r 128 \
+    --lora_alpha 256 \
+    --lora_dropout 0.05 \
+    \
     --bf16 True \
     --run_name $RUN_NAME \
     --output_dir /data/wiedmann/llava-streaming/$RUN_NAME \
-    --num_train_epochs 1 \
+    --num_train_epochs 5 \
     --per_device_train_batch_size 2 \
     --per_device_eval_batch_size 4 \
     --gradient_accumulation_steps 16 \
-    --evaluation_strategy "no" \
+    --evaluation_strategy "steps" \
+    --eval_steps 100 \
     --save_strategy "steps" \
     --save_steps 100 \
     --save_total_limit 1 \
@@ -106,5 +113,6 @@ deepspeed --master_port 30000 \
     --dataloader_drop_last True \
     --frames_upbound 128 \
     --add_time_instruction False \
-    --force_sample False
+    --force_sample False \
+    --val_split_fraction 0.01
 exit 0;
