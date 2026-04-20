@@ -47,7 +47,7 @@ export WANDB_PROJECT="llava-streaming-agg"
 PREV_STAGE_CHECKPOINT="/data/wiedmann/hub/models--lmms-lab--llava-onevision-qwen2-7b-ov/snapshots/0b07bf7565e244cf4f39982249eafe8cd799d6dd"
 
 PROMPT_VERSION="qwen_1_5"
-RUN_NAME="llavanext-${VISION_MODEL_VERSION_CLEAN}-${LLM_VERSION_CLEAN}-nextqa_shuffled-streaming_baseline_final_lora_agg_fc4_s4096"
+RUN_NAME="llavanext-${VISION_MODEL_VERSION_CLEAN}-${LLM_VERSION_CLEAN}-nextqa_shuffled-streaming_baseline_final2_lora_agg_fc4_s4096"
 echo "RUN_NAME: ${RUN_NAME}"
 echo "PREV_STAGE_CHECKPOINT: ${PREV_STAGE_CHECKPOINT}"
 
@@ -90,10 +90,10 @@ deepspeed --master_port 30000 \
     --bf16 True \
     --run_name $RUN_NAME \
     --output_dir /data/wiedmann/llava-streaming/$RUN_NAME \
-    --num_train_epochs 5 \
+    --num_train_epochs 2 \
     --per_device_train_batch_size 2 \
     --per_device_eval_batch_size 4 \
-    --gradient_accumulation_steps 16 \
+    --gradient_accumulation_steps 8 \
     --evaluation_strategy "steps" \
     --eval_steps 100 \
     --save_strategy "steps" \
