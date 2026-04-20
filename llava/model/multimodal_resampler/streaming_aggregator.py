@@ -1,30 +1,21 @@
 """
-StreamingStateAggregator — simple streaming state baseline.
+StreamingStateAggregator — bidirectional dual decoder.
 
 Architecture: learned state tokens are updated recurrently via a stack of
-StateDecoderBlocks.  Each block:
-  1. State self-attention (RoPE-1D over state positions)
-  2. Cross-attention to the current frame chunk (RoPE-2D on frame keys)
-  3. FFN
+dual DecoderBlocks.  Each layer per chunk step:
 
-The frame path of the old dual-decoder is removed; only the state stream is
-maintained.
+    state_l = StateBlock(state_{l-1}, frame_{l-1})   # state reads from frame
+    frame_l = FrameBlock(frame_{l-1}, state_{l-1})   # frame reads from state
 
-Chunked streaming:
-  - call init_state() once, then step() for each vision-encoder chunk,
-    then finalize().  Peak activation memory per decode step is
-    O(frames_per_chunk × patches_per_frame × state_dim).
+Both blocks use the PREVIOUS layer's outputs as cross-attention context.
+The frame branch is discarded after each chunk; only state persists.
 
-LLaVA norm notes:
-  - Frame tokens are selected from layer -2 of SigLIP (before the final
-    LayerNorm of the vision encoder).  frame_proj maps them to state_dim;
-    norm_ctx inside each block normalises them so their scale is compatible
-    with the state stream.
-  - State tokens are pre-normed inside each block (pre-norm architecture).
-  - state_norm at the end brings output into the space the LLM expects.
+StateBlock:  state self-attn (RoPE-1D) → cross-attn to frame (RoPE-1D q, RoPE-2D k) → FFN
+FrameBlock:  frame self-attn (RoPE-2D) → cross-attn to state (RoPE-2D q, RoPE-1D k) → FFN
+
+A chunk_norm is applied to state after every sub-chunk update.
 """
 
-import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -147,19 +138,28 @@ class Attention(nn.Module):
         self.proj = nn.Linear(dim, dim, bias=True)
         self.rope = rope
 
-    def forward(self, x, pos=None):
+    def forward(self, x, pos=None, key_padding_mask=None):
         B, N, C = x.shape
         qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
         q, k, v = qkv.unbind(0)
         if self.rope is not None and pos is not None:
             q = self.rope(q, pos)
             k = self.rope(k, pos)
-        out = F.scaled_dot_product_attention(q, k, v, scale=self.scale)
+        attn_mask = None
+        if key_padding_mask is not None:
+            attn_mask = torch.zeros((B, 1, N, N), device=x.device, dtype=q.dtype)
+            attn_mask = attn_mask.masked_fill(
+                ~key_padding_mask.bool()[:, None, None, :],
+                torch.finfo(q.dtype).min,
+            )
+        out = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, scale=self.scale)
         return self.proj(out.transpose(1, 2).reshape(B, N, C))
 
 
 class CrossAttention(nn.Module):
-    def __init__(self, dim, num_heads=8, rope_k=None):
+    """Cross-attention with separate RoPE for queries (x_pos) and keys (ctx_pos)."""
+
+    def __init__(self, dim, num_heads=8, rope_q=None, rope_k=None):
         super().__init__()
         self.num_heads = num_heads
         self.head_dim = dim // num_heads
@@ -168,14 +168,17 @@ class CrossAttention(nn.Module):
         self.proj_k = nn.Linear(dim, dim, bias=True)
         self.proj_v = nn.Linear(dim, dim, bias=True)
         self.proj_out = nn.Linear(dim, dim, bias=True)
+        self.rope_q = rope_q
         self.rope_k = rope_k
 
-    def forward(self, x, context, ctx_pos=None, ctx_key_padding_mask=None):
+    def forward(self, x, context, x_pos=None, ctx_pos=None, ctx_key_padding_mask=None):
         B, N, C = x.shape
         M = context.shape[1]
         q = self.proj_q(x).reshape(B, N, self.num_heads, self.head_dim).transpose(1, 2)
         k = self.proj_k(context).reshape(B, M, self.num_heads, self.head_dim).transpose(1, 2)
         v = self.proj_v(context).reshape(B, M, self.num_heads, self.head_dim).transpose(1, 2)
+        if self.rope_q is not None and x_pos is not None:
+            q = self.rope_q(q, x_pos)
         if self.rope_k is not None and ctx_pos is not None:
             k = self.rope_k(k, ctx_pos)
         attn_mask = None
@@ -201,36 +204,36 @@ class FeedForward(nn.Module):
         return self.fc2(self.act(self.fc1(x)))
 
 
-class StateDecoderBlock(nn.Module):
+class DecoderBlock(nn.Module):
     """
-    Pre-norm decoder block:
-      state = state + self_attn(norm1(state))            [RoPE-1D on state]
-      state = state + cross_attn(norm2(state), norm_ctx(frames))  [RoPE-2D on frame keys]
-      state = state + ffn(norm3(state))
+    Pre-norm decoder block: self-attn → cross-attn → FFN.
+
+    rope_sattn: applied to both self-attention q/k AND cross-attention queries.
+    rope_cattn: applied to cross-attention keys.
     """
 
     def __init__(self, dim, num_heads=8, mlp_ratio=4.0, rope_sattn=None, rope_cattn=None):
         super().__init__()
         self.norm1 = nn.LayerNorm(dim)
         self.self_attn = Attention(dim, num_heads=num_heads, rope=rope_sattn)
-
         self.norm2 = nn.LayerNorm(dim)
-        self.norm_ctx = nn.LayerNorm(dim)   # re-normalize SigLIP tokens after frame_proj
-        self.cross_attn = CrossAttention(dim, num_heads=num_heads, rope_k=rope_cattn)
-
+        self.norm_context = nn.LayerNorm(dim)
+        self.cross_attn = CrossAttention(dim, num_heads=num_heads, rope_q=rope_sattn, rope_k=rope_cattn)
         self.norm3 = nn.LayerNorm(dim)
         self.ffn = FeedForward(dim, mlp_ratio=mlp_ratio)
 
-    def forward(self, state, frame_tokens, state_pos=None, frame_pos=None, frame_attn_mask=None):
-        state = state + self.self_attn(self.norm1(state), state_pos)
-        state = state + self.cross_attn(
-            self.norm2(state),
-            self.norm_ctx(frame_tokens),
-            ctx_pos=frame_pos,
-            ctx_key_padding_mask=frame_attn_mask,
+    def forward(self, x, context, x_pos=None, ctx_pos=None,
+                self_key_padding_mask=None, ctx_key_padding_mask=None):
+        x = x + self.self_attn(self.norm1(x), x_pos, key_padding_mask=self_key_padding_mask)
+        x = x + self.cross_attn(
+            self.norm2(x),
+            self.norm_context(context),
+            x_pos=x_pos,
+            ctx_pos=ctx_pos,
+            ctx_key_padding_mask=ctx_key_padding_mask,
         )
-        state = state + self.ffn(self.norm3(state))
-        return state
+        x = x + self.ffn(self.norm3(x))
+        return x
 
 
 # ---------------------------------------------------------------------------
@@ -239,57 +242,60 @@ class StateDecoderBlock(nn.Module):
 
 class StreamingStateAggregator(nn.Module):
     """
-    Compresses (B, T, N, D) patch-wise video embeddings into
-    (B, S, state_dim) state tokens via a recurrent state decoder.
+    Bidirectional streaming aggregator with dual state/frame decoder.
 
-    Streaming / chunked use:
-        state = agg.init_state(B, device)
-        for chunk in vision_encoder_chunks:
-            state = agg.step(state, chunk)
-        out = agg.finalize(state, return_state_tokens=True)
+    S learned state tokens are updated recurrently.  At each chunk, a frame
+    decoder branch runs in parallel so the frame tokens are enriched by the
+    accumulated state before the state cross-attends to them.
 
-    frames_per_chunk controls how many frames the decoder processes in one
-    recurrent sub-step.  For SigLIP-so400m-384 (27×27 = 729 patches/frame),
-    set frames_per_chunk=1 and patches_per_frame=729 to process one frame
-    per decoder step.
+    Each layer per step:
+        state ← StateBlock(state, frame)   [state self-attn RoPE-1D, frame keys RoPE-2D]
+        frame ← FrameBlock(frame, state)   [frame self-attn RoPE-2D, state keys RoPE-1D]
+    Both use the PREVIOUS layer's outputs as context.
+    Frame branch is discarded after each chunk.
+    chunk_norm is applied to state after every sub-chunk update.
+    layer_weights (learned, softmax-normalised) fuse the state outputs from
+    all L layers into a single representation before carrying state forward —
+    analogous to ELMo/BERT layer weighting, applied per chunk step.
     """
 
     def __init__(self, model_args):
         super().__init__()
-        self.input_dim        = model_args.mm_streaming_input_dim
-        self.state_dim        = model_args.mm_streaming_state_dim
-        self.num_state_tokens = model_args.mm_streaming_num_state_tokens
-        self.num_layers       = model_args.mm_streaming_num_layers
-        self.frames_per_chunk = model_args.mm_streaming_frames_per_chunk
+        self.input_dim         = model_args.mm_streaming_input_dim
+        self.state_dim         = model_args.mm_streaming_state_dim
+        self.num_state_tokens  = model_args.mm_streaming_num_state_tokens
+        self.num_layers        = model_args.mm_streaming_num_layers
+        self.frames_per_chunk  = model_args.mm_streaming_frames_per_chunk
         self.patches_per_frame = model_args.mm_streaming_patches_per_frame
         self.chunk_size        = self.frames_per_chunk * self.patches_per_frame
 
         num_heads = model_args.mm_streaming_num_heads
         mlp_ratio = model_args.mm_streaming_mlp_ratio
-        rope_freq = 100.0
+        rope_freq  = 100.0
 
         rope1d = RoPE1D(freq=rope_freq)
         rope2d = RoPE2D(freq=rope_freq)
 
-        # Learned initial state — embed directly into state_dim
         self.state_tokens = nn.Embedding(self.num_state_tokens, self.state_dim)
         self.register_buffer("state_pos", torch.arange(self.num_state_tokens, dtype=torch.long))
 
-        # Project vision-encoder tokens into state_dim
         self.frame_proj = nn.Linear(self.input_dim, self.state_dim)
 
-        self.decoder = nn.ModuleList([
-            StateDecoderBlock(
-                self.state_dim,
-                num_heads=num_heads,
-                mlp_ratio=mlp_ratio,
-                rope_sattn=rope1d,   # 1D positions over state tokens
-                rope_cattn=rope2d,   # 2D spatial positions over frame tokens
-            )
+        # State decoder: state self-attn (RoPE-1D), cross-attn to frame (RoPE-2D keys)
+        self.state_decoder = nn.ModuleList([
+            DecoderBlock(self.state_dim, num_heads=num_heads, mlp_ratio=mlp_ratio,
+                         rope_sattn=rope1d, rope_cattn=rope2d)
+            for _ in range(self.num_layers)
+        ])
+        # Frame decoder: frame self-attn (RoPE-2D), cross-attn to state (RoPE-1D keys)
+        self.frame_decoder = nn.ModuleList([
+            DecoderBlock(self.state_dim, num_heads=num_heads, mlp_ratio=mlp_ratio,
+                         rope_sattn=rope2d, rope_cattn=rope1d)
             for _ in range(self.num_layers)
         ])
 
-        # Final norm before handing off to the LLM
+        self.layer_weights = nn.Parameter(torch.zeros(self.num_layers))
+        self.chunk_norm = nn.LayerNorm(self.state_dim)
         self.state_norm = nn.LayerNorm(self.state_dim)
 
         self._frame_pos_cache: dict = {}
@@ -314,8 +320,8 @@ class StreamingStateAggregator(nn.Module):
             "mm_streaming_state_dim": self.state_dim,
             "mm_streaming_num_state_tokens": self.num_state_tokens,
             "mm_streaming_num_layers": self.num_layers,
-            "mm_streaming_num_heads": self.decoder[0].self_attn.num_heads,
-            "mm_streaming_mlp_ratio": self.decoder[0].ffn.fc1.out_features / self.state_dim,
+            "mm_streaming_num_heads": self.state_decoder[0].self_attn.num_heads,
+            "mm_streaming_mlp_ratio": self.state_decoder[0].ffn.fc1.out_features / self.state_dim,
             "mm_streaming_frames_per_chunk": self.frames_per_chunk,
             "mm_streaming_patches_per_frame": self.patches_per_frame,
         }
@@ -327,15 +333,10 @@ class StreamingStateAggregator(nn.Module):
     def init_state(self, batch_size: int, device) -> torch.Tensor:
         """Return (B, S, state_dim) initial recurrent state."""
         idx = torch.arange(self.num_state_tokens, device=device)
-        state = self.state_tokens(idx)             # (S, state_dim)
-        return state.unsqueeze(0).repeat(batch_size, 1, 1)
+        return self.state_tokens(idx).unsqueeze(0).repeat(batch_size, 1, 1)
 
     def _build_frame_pos_2d(self, batch_size, chunk_len, frame_offset, device):
-        """Build (chunk_len, 2) position tensor for cross-attention keys.
-
-        Dim 0 — absolute frame index in the video (encodes temporal order).
-        Dim 1 — flat spatial patch index within the frame (0 … patches_per_frame-1).
-        """
+        """Build (B, chunk_len, 2) positions: dim-0 = absolute frame index, dim-1 = patch index."""
         key = (chunk_len, frame_offset, device)
         if key not in self._frame_pos_cache:
             ppf = self.patches_per_frame
@@ -344,31 +345,44 @@ class StreamingStateAggregator(nn.Module):
                 f"patches_per_frame must match the vision encoder's patch count per frame."
             )
             n_frames = chunk_len // ppf
-            t_positions = (
+            t_pos = (
                 torch.arange(n_frames, device=device, dtype=torch.float32) + frame_offset
-            ).repeat_interleave(ppf)                                             # (chunk_len,)
-            s_positions = torch.arange(ppf, device=device, dtype=torch.float32).repeat(n_frames)  # (chunk_len,)
-            self._frame_pos_cache[key] = torch.stack([t_positions, s_positions], dim=-1)  # (chunk_len, 2)
+            ).repeat_interleave(ppf)
+            s_pos = torch.arange(ppf, device=device, dtype=torch.float32).repeat(n_frames)
+            self._frame_pos_cache[key] = torch.stack([t_pos, s_pos], dim=-1)
         return self._frame_pos_cache[key].unsqueeze(0).expand(batch_size, -1, -1)
 
-    def _decode(self, state, frame_embeddings_slice, state_pos, frame_pos, frame_attn_mask):
-        """Project, mask and decode one chunk of raw vision-encoder tokens.
+    def _dual_decode(self, state, frame_embeddings_slice, state_pos, frame_pos, frame_attn_mask):
+        """Project and decode one chunk via the bidirectional dual decoder.
 
-        frame_embeddings_slice: (B, chunk_len, input_dim) — no-grad slice from the
-            vision tower.  frame_proj is computed HERE so that, when this function
-            is wrapped by torch_checkpoint, the frame_proj activations are recomputed
-            during backward instead of being stored for the full recurrent chain.
-            Gradient for frame_proj.weight is still correctly accumulated: the
-            checkpoint's backward reruns this function and autograd finds frame_proj
-            in the computation graph via `self`.
+        Uses previous-layer outputs as cross-attention context (not sibling's
+        current-layer output).  Frame branch update is skipped on the final
+        layer since frame tokens are discarded after each chunk.
         """
         frame_tokens = self.frame_proj(frame_embeddings_slice)
-        # Zero padded positions; cross-attention also masks them, but being explicit
-        # avoids any numerical noise from LayerNorm on near-zero inputs.
         frame_tokens = frame_tokens * frame_attn_mask.unsqueeze(-1).to(frame_tokens.dtype)
-        for block in self.decoder:
-            state = block(state, frame_tokens, state_pos, frame_pos, frame_attn_mask)
-        return state
+
+        last = self.num_layers - 1
+        layer_states = []
+        for i, (state_block, frame_block) in enumerate(zip(self.state_decoder, self.frame_decoder)):
+            prev_state = state
+            prev_frame = frame_tokens
+            state = state_block(
+                prev_state, prev_frame,
+                x_pos=state_pos, ctx_pos=frame_pos,
+                ctx_key_padding_mask=frame_attn_mask,
+            )
+            layer_states.append(state)
+            if i < last:
+                frame_tokens = frame_block(
+                    prev_frame, prev_state,
+                    x_pos=frame_pos, ctx_pos=state_pos,
+                    self_key_padding_mask=frame_attn_mask,
+                )
+                frame_tokens = frame_tokens * frame_attn_mask.unsqueeze(-1).to(frame_tokens.dtype)
+
+        weights = F.softmax(self.layer_weights, dim=0)  # (L,)
+        return sum(w * s for w, s in zip(weights, layer_states))
 
     def step(
         self,
@@ -386,7 +400,6 @@ class StreamingStateAggregator(nn.Module):
             mask:             optional bool mask; (B, T) for 4-D input,
                               (B, T*N) for already-flat 3-D input
             frame_offset:     absolute index of the first frame in this chunk
-                              within the full video (used for temporal positions)
 
         Returns:
             (B, S, state_dim) updated state
@@ -413,7 +426,6 @@ class StreamingStateAggregator(nn.Module):
             else:
                 chunk_mask = torch.ones((B, chunk_len), device=device, dtype=torch.bool)
 
-            # Ensure at least one valid key per sample to avoid NaN in attn
             active = chunk_mask.any(dim=1)
             attn_mask = chunk_mask.clone()
             if (~active).any():
@@ -421,16 +433,16 @@ class StreamingStateAggregator(nn.Module):
 
             if self.training:
                 new_state = torch_checkpoint(
-                    self._decode, state, frame_embeddings[:, t0:t1], state_pos,
+                    self._dual_decode, state, frame_embeddings[:, t0:t1], state_pos,
                     frame_pos, attn_mask, use_reentrant=False,
                 )
             else:
-                new_state = self._decode(
+                new_state = self._dual_decode(
                     state, frame_embeddings[:, t0:t1], state_pos, frame_pos, attn_mask
                 )
 
-            # Skip update for fully-padded samples
             state = torch.where(active.view(B, 1, 1), new_state, state)
+            state = self.chunk_norm(state)
 
         return state
 

@@ -20,7 +20,7 @@ DATA_YAML="scripts/video/train/nextqa_experiment.yaml"
 
 # Optional: path to a StreamingStateAggregator checkpoint from rep_sim linear
 # probe training. Leave empty to start from random initialisation.
-STREAMING_PRETRAINED="/data/wiedmann/llava-streaming/aggregator_pretrain_4096/aggregator_best.pt"
+STREAMING_PRETRAINED="/data/wiedmann/llava-streaming/aggregator_dualdecode_pretrain_4096/aggregator_best.pt"
 
 ############### Prepare Envs #################
 if [ -z "$CUDA_HOME" ] || [ ! -f "$CUDA_HOME/bin/nvcc" ]; then
@@ -47,7 +47,7 @@ export WANDB_PROJECT="llava-streaming-agg"
 PREV_STAGE_CHECKPOINT="/data/wiedmann/hub/models--lmms-lab--llava-onevision-qwen2-7b-ov/snapshots/0b07bf7565e244cf4f39982249eafe8cd799d6dd"
 
 PROMPT_VERSION="qwen_1_5"
-RUN_NAME="llavanext-${VISION_MODEL_VERSION_CLEAN}-${LLM_VERSION_CLEAN}-nextqa_shuffled-streaming_baseline_final2_lora_agg_fc4_s4096"
+RUN_NAME="llavanext-${VISION_MODEL_VERSION_CLEAN}-${LLM_VERSION_CLEAN}-nextqa_shuffled-streaming_baseline_dualdecode_lora_agg_fc4_s4096"
 echo "RUN_NAME: ${RUN_NAME}"
 echo "PREV_STAGE_CHECKPOINT: ${PREV_STAGE_CHECKPOINT}"
 
@@ -97,7 +97,7 @@ deepspeed --master_port 30000 \
     --evaluation_strategy "steps" \
     --eval_steps 100 \
     --save_strategy "steps" \
-    --save_steps 100 \
+    --save_steps 1000 \
     --save_total_limit 1 \
     --learning_rate 1e-4 \
     --weight_decay 0. \
