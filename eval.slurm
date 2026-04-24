@@ -5,7 +5,7 @@
 #SBATCH -C A6000
 #SBATCH --gpus-per-node=1
 #SBATCH --time=47:59:00
-#SBATCH --array=0-2
+#SBATCH --array=0
 #SBATCH --output=/home/wiedmann/LLaVA-NeXT/logs/eval/%A-%a.out
 #SBATCH --error=/home/wiedmann/LLaVA-NeXT/logs/eval/%A-%a.err
 
@@ -17,7 +17,7 @@ source .venv/bin/activate
 
 # model_dir="lmms-lab/llava-onevision-qwen2-7b-ov"
 
-RUN_NAME="llavanext-google_siglip-so400m-patch14-384-Qwen_Qwen2-7B-Instruct-nextqa_shuffled-streaming_baseline_final2_lora_agg_fc4_s4096"
+RUN_NAME="llavanext-google_siglip-so400m-patch14-384-Qwen_Qwen2-7B-Instruct-SI-nextqa_shuffled-streaming_baseline_dualdecode_lora_agg_fc4_s4096"
 BASE_CHECKPOINT="/data/wiedmann/hub/models--lmms-lab--llava-onevision-qwen2-7b-ov/snapshots/0b07bf7565e244cf4f39982249eafe8cd799d6dd"
 
 output_dir="/data/wiedmann/llava-streaming/$RUN_NAME"
@@ -35,7 +35,7 @@ if [[ -z "$model_dir" ]]; then
     exit 1
 fi
 
-frame_counts=(32 64 128)
+frame_counts=(32)
 echo "model_dir: $model_dir"
 
 python -m lmms_eval \

@@ -1,26 +1,20 @@
 #!/bin/bash
-# Fine-tune LLaVA-7B with the StreamingStateAggregator as a temporal resampler.
+# Fine-tune LLaVA-7B on NextQA without any temporal resampler (baseline).
 #
 # What is trained:
-#   - vision_resampler  (StreamingStateAggregator, randomly initialised or from
-#                        --mm_streaming_pretrained if provided)
-#   - mm_projector      (adapts to aggregator output statistics)
+#   - mm_projector      (MLP adapter)
 #
 # What is frozen:
 #   - vision_tower      (SigLIP-so400m)
 #   - LLM               (Qwen2-7B)
 #
 # Token budget:
-#   S=4096 state tokens per video vs. ~5824 for the spatial-pool baseline.
-#   8192 context window fits 4096 video tokens + short text context.
+#   Uses the default spatial_unpad pooling (~5824 tokens for 128 frames).
+#   8192 context window; long videos may be truncated.
 
 IMAGE_FOLDER=""
 VIDEO_FOLDER="/data/wiedmann"
 DATA_YAML="scripts/video/train/nextqa_experiment.yaml"
-
-# Optional: path to a StreamingStateAggregator checkpoint from rep_sim linear
-# probe training. Leave empty to start from random initialisation.
-STREAMING_PRETRAINED="/data/wiedmann/llava-streaming/aggregator_dualdecode_pretrain_4096/aggregator_best.pt"
 
 ############### Prepare Envs #################
 if [ -z "$CUDA_HOME" ] || [ ! -f "$CUDA_HOME/bin/nvcc" ]; then
@@ -29,7 +23,6 @@ fi
 export CUDA_HOME
 export PATH=$CUDA_HOME/bin:$PATH
 echo "Using CUDA_HOME: $CUDA_HOME"
-#python3 -m pip install flash-attn --no-build-isolation
 MAX_JOBS=8 uv pip -v install flash-attn==2.5.7 --no-build-isolation
 alias python=python3
 ############### Show Envs ####################
@@ -43,15 +36,14 @@ VISION_MODEL_VERSION_CLEAN="${VISION_MODEL_VERSION//\//_}"
 
 export WANDB_PROJECT="llava-streaming-agg"
 
-# Start from the pretrained LLaVA-7B one-vision checkpoint
 PREV_STAGE_CHECKPOINT="/data/wiedmann/hub/models--lmms-lab--llava-onevision-qwen2-7b-si"
 
 PROMPT_VERSION="qwen_1_5"
-RUN_NAME="llavanext-${VISION_MODEL_VERSION_CLEAN}-${LLM_VERSION_CLEAN}-SI-nextqa_shuffled-streaming_baseline_dualdecode_lora_agg_fc4_s4096"
+RUN_NAME="llavanext-${VISION_MODEL_VERSION_CLEAN}-${LLM_VERSION_CLEAN}-SI-nextqa_shuffled-baseline_lora_mlp"
 echo "RUN_NAME: ${RUN_NAME}"
 echo "PREV_STAGE_CHECKPOINT: ${PREV_STAGE_CHECKPOINT}"
 
-deepspeed --master_port 30000 \
+deepspeed --master_port 30005 \
     llava/train/train_mem.py \
     --deepspeed scripts/zero2.json \
     --model_name_or_path $PREV_STAGE_CHECKPOINT \
@@ -66,21 +58,10 @@ deepspeed --master_port 30000 \
     --mm_use_im_start_end False \
     --mm_use_im_patch_token False \
     \
-    --mm_resampler_type streaming_agg \
-    --mm_streaming_input_dim 1152 \
-    --mm_streaming_state_dim 1152 \
-    --mm_streaming_num_state_tokens 4096 \
-    --mm_streaming_num_layers 4 \
-    --mm_streaming_num_heads 8 \
-    --mm_streaming_frames_per_chunk 4 \
-    --mm_streaming_patches_per_frame 729 \
-    --mm_streaming_vision_chunk_size 4 \
-    --mm_streaming_pretrained "${STREAMING_PRETRAINED}" \
-    \
     --mm_patch_merge_type spatial_unpad \
     --mm_newline_position no_token \
     \
-    --mm_tunable_parts="mm_mlp_adapter,mm_vision_resampler" \
+    --mm_tunable_parts="mm_mlp_adapter" \
     \
     --lora_enable True \
     --lora_r 128 \
@@ -111,7 +92,7 @@ deepspeed --master_port 30000 \
     --lazy_preprocess True \
     --report_to wandb \
     --dataloader_drop_last True \
-    --frames_upbound 128 \
+    --frames_upbound 32 \
     --add_time_instruction False \
     --force_sample False \
     --val_split_fraction 0.01
