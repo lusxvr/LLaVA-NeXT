@@ -17,8 +17,8 @@ source .venv/bin/activate
 
 # model_dir="lmms-lab/llava-onevision-qwen2-7b-ov"
 
-RUN_NAME="llavanext-google_siglip-so400m-patch14-384-Qwen_Qwen2-7B-Instruct-SI-nextqa_shuffled-streaming_baseline_dualdecode_lora_agg_fc4_s4096"
-BASE_CHECKPOINT="/data/wiedmann/hub/models--lmms-lab--llava-onevision-qwen2-7b-ov/snapshots/0b07bf7565e244cf4f39982249eafe8cd799d6dd"
+RUN_NAME="llavanext-google_siglip-so400m-patch14-384-Qwen_Qwen2-0.5B-Instruct-nextqa_shuffled-streaming_baseline_dualdecode_lora_agg_fc4_s2048"
+BASE_CHECKPOINT="/data/wiedmann/hub/models--lmms-lab--llava-onevision-qwen2-0.5b-ov/"
 
 output_dir="/data/wiedmann/llava-streaming/$RUN_NAME"
 

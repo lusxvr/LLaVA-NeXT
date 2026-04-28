@@ -12,4 +12,4 @@
 cd /home/wiedmann/LLaVA-NeXT
 source .venv/bin/activate
 
-bash scripts/video/train/streaming_agg_finetune.sh
+bash scripts/video/train/streaming_agg_small_finetune.sh
